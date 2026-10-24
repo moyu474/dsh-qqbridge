@@ -1,0 +1,12 @@
+# 绝不提交的东西
+node_modules/
+state/
+config.json
+*.log
+*.bak
+*.bak-*
+*.tgz
+
+# 部署产物
+dist/
+pkg-dist/

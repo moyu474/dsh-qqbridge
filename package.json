@@ -1,0 +1,38 @@
+{
+  "name": "dsh-qqbridge",
+  "version": "0.2.0",
+  "private": true,
+  "description": "把 QQ 接入 DSH（带 lite 模式与人格式定制的完整部署）。插件本身不含任何账号/密钥/服务器信息。",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "qq",
+    "qqbridge",
+    "deploy"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "LICENSE-UPSTREAM"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": "",
+  "author": "dsh-qqbridge contributors"
+}
