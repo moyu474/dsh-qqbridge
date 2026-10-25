@@ -623,7 +623,7 @@ function appendActivity(line) {
   appendActivityLog(`[${localClock()}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
 }
 
-// 读取角色/模式状态：{"role": "傲娇助手", "mode": "active"|"silent"}
+// 读取角色/模式状态：{"role": "某个角色名", "mode": "active"|"silent"}
 function readRoleState() {
   return readJsonSafe(ROLE_STATE_FILE, { role: null, mode: 'active' });
 }
