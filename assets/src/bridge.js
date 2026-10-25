@@ -12948,9 +12948,12 @@ async function main() {
     // 命令可能带称呼前缀：主人发过「大肥鱼，/role 萝莉」，因为不是以 / 开头，
     // 整条被当成聊天抛给了模型（2026-10-22 实测：模型还回了「/role 是干嘛的」）。
     // 这里把「称呼 + 标点 + /命令」剥成纯命令。只认紧跟着标点的 /，不会误伤正文里的斜杠。
-    if (!plainContent.startsWith('/')) {
+    // 链接不能这么剥：https: 里的冒号会被当成「称呼 + 标点」，剥出来的 //www...
+    // 以 / 开头就被当命令，群友发 B 站链接会收到「管理命令仅管理员可用」（2026-10-25 实测）。
+    // 双保险：①http(s):// 开头的整段跳过 ②剥出来的必须是「/词」，//host 不算。
+    if (!plainContent.startsWith('/') && !/^https?:\/\//i.test(plainContent)) {
       const cm = String(plainContent).match(/^[^\/，,：:\s]{1,14}[，,：:\s]\s*(\/[\s\S]+)$/);
-      if (cm) plainContent = cm[1].trim();
+      if (cm && /^\/[^\/\s]/.test(cm[1])) plainContent = cm[1].trim();
     }
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）

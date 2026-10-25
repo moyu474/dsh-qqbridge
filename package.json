@@ -1,6 +1,6 @@
 {
   "name": "dsh-qqbridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "把 QQ 接入 DSH（带 lite 模式与人格式定制的完整部署）。插件本身不含任何账号/密钥/服务器信息。",
   "keywords": [
