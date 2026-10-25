@@ -1,0 +1,10 @@
+[Unit]
+Description=每 2 分钟刷新 qq-bridge 当天滚动临时库
+
+[Timer]
+OnCalendar=*:0/2
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

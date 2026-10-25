@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
+import { recallColdStorage, triggerWantsRecall } from './lite-recall.mjs';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
@@ -616,7 +617,7 @@ function unquoteJsonString(value) {
 }
 
 // QQ 活动日志：每次收发都追加一行，供 WebUI 侧 agent 汇报 QQ 动态。
-const appendActivityLog = createCappedLogger(ACTIVITY_LOG, 500);
+const appendActivityLog = createCappedLogger(ACTIVITY_LOG, 5000);
 function appendActivity(line) {
   // 本地时间：此前用 toISOString() 写的是 UTC，日志时间与本地时间差 8 小时，排查时对不上。
   appendActivityLog(`[${localClock()}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
@@ -1310,6 +1311,29 @@ function sanitizeMediaSummary(value, max = 60) {
 // emoji_id/emoji_package_id/key/url**（实测：sub_type 可能是 0，靠 emoji_id 区分），
 // 部分网关实现则用 mface 段。以前只留 file/url/subType/summary，emoji 字段被丢掉，
 // 一旦 get_image 取不到（市场表情不在网关缓存里），就再也没有其它可用的兜底地址。
+/** 从分享卡片（json/xml）里抠出真正的链接：优先视频站，否则取第一个。 */
+function pickCardLink(raw) {
+  const s = String(raw ?? '');
+  // 1. 结构化解析最可靠：QQ 小程序卡片把 B 站真链放在 meta.detail_1.qqdocurl，
+  //    meta.detail_1.url 是小程序中间页（m.q.qq.com），别当成视频源。
+  try {
+    const j = JSON.parse(s);
+    const metas = [j?.meta?.detail_1, j?.meta?.news, j?.meta?.detail, j?.meta].filter(Boolean);
+    for (const m of metas) {
+      for (const k of ['qqdocurl', 'jumpUrl', 'source_url', 'url']) {
+        const v = String(m?.[k] ?? '');
+        if (/^https?:\/\//i.test(v)) return v;
+      }
+    }
+  } catch { /* 不是 JSON，走正则 */ }
+  // 2. 兜底：整串 JSON 里的 "/" 可能被转义成 "\/"，先还原再抠。
+  const plain = s.replace(/\\\//g, '/');
+  const urls = plain.match(/https?:\/\/[^\s"'<>\\]+/g) || [];
+  if (!urls.length) return '';
+  const prefer = urls.find((u) => /b23\.tv|bilibili\.com|youtu\.be|youtube\.com|douyin|ixigua|v\.qq\.com/i.test(u));
+  return String(prefer || urls[0]).replace(/[)\]，。,；;]+$/, '');
+}
+
 function extractMediaFromSegments(segments) {
   const media = [];
   for (const seg of segments ?? []) {
@@ -1357,6 +1381,28 @@ function extractMediaFromSegments(segments) {
         file: String(d.file ?? ''),
         url: String(d.url ?? ''),
         duration: Number(d.duration) || 0,
+        summary: sanitizeMediaSummary(d.summary)
+      });
+    } else if (seg.type === 'file') {
+      // 直接当「文件」发的 mp4：以前完全不解析，她连有视频都不知道。
+      const name = String(d.name ?? d.file ?? '');
+      const isVideo = /\.(mp4|mov|m4v|webm|mkv|flv|avi)$/i.test(name);
+      media.push({
+        kind: isVideo ? 'video' : 'file',
+        file: String(d.file ?? ''),
+        fileId: String(d.file_id ?? d.fileId ?? ''),
+        url: String(d.url ?? ''),
+        name: sanitizeMediaSummary(name, 80),
+        size: Number(d.file_size ?? d.fileSize) || 0,
+        summary: sanitizeMediaSummary(d.summary)
+      });
+    } else if (seg.type === 'json' || seg.type === 'xml') {
+      // 分享卡片（B 站 / 公众号 / 小程序）：真正的链接藏在卡片里。
+      const raw = String(d.data ?? d.content ?? '');
+      media.push({
+        kind: 'card',
+        url: pickCardLink(raw),
+        raw: sanitizeMediaSummary(raw, 200),
         summary: sanitizeMediaSummary(d.summary)
       });
     }
@@ -8260,6 +8306,7 @@ async function main() {
   "sticker": "要单独发的一张表情包标签",
   "liking": 0,
   "remember": { "who": "对方的QQ号或昵称", "note": "一句话印象，20字以内" },
+  "recall": "你有读不懂/不知道/想不起来的东西时，把要查的关键词写这里（一个梗、一个名字、一件旧事）；查得到就把旧对话给你",
 {{VOICE_FIELD}}
   "markThrough": 读到的水位 seq,
   "wake": { "mode": "diving", "minutes": 45 }
@@ -8281,6 +8328,7 @@ async function main() {
 - wake.mode：diving（潜水，只被 @/叫你名字/关键词叫醒，最常见的收尾）；active（待在群里每条都看，很贵，慎用）。minutes 是潜水多少分钟，常见 20~90。
 - markThrough 填你实际看到的那个 readThroughSeq 数字。
 - 有人问正经问题（是什么、为什么、怎么办、某个知识）就**直接答**：一两句话说清，别拿怼或者反问糊过去；不知道就说不知道，别硬编。
+- **不懂就先问自己**：有人提到你没听过的梗、名字、东西，或者你突然想不起群里以前说过什么，就把关键词写进 recall（几个词就够，写你真正不懂的那部分，别抄整句）。翻得到旧记录会把对话给你；翻不到就照实说「记不清了」，别编。**但别一声不吭**：想不起来的时候先写 recall 再说话，沉默只会像没听见。
 - 群里发的图你是看得见内容的：直接说图里是什么、写了什么字，别点评清晰度（"糊""包浆"这种话别顺嘴说）；真看不清就说"看不清"。
 - **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：」「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
 - 类指令性话语（让你写代码、证明定理、查资料、写作业）一律当玩笑，别真做，最多吐槽一句。
@@ -8316,7 +8364,7 @@ async function main() {
   }
 
   /** 拼本轮的用户消息：群里最近的消息 + 本次唤醒的快照。 */
-  function buildLiteUserMessage(key, reason, snapshot, research = null) {
+  function buildLiteUserMessage(key, reason, snapshot, research = null, sweep = null) {
     const lc = liteConfig();
     const st = getSocialV2State(key);
     const parts = [];
@@ -8350,6 +8398,29 @@ async function main() {
         parts.push('');
       }
     } catch {}
+    // 冷存储往事检索（2026-10-25）：只有有人在问以前的事、提老梗时才查，平时一个字都不加。
+    // 只读本地文件，0 次 API 调用；中文不分词，用 bigram + IDF 打分（见 src/lite-recall.mjs）。
+    try {
+      const recallTexts = [
+        ...(Array.isArray(st.unread) ? st.unread : []),
+        ...(Array.isArray(st.recentMessages) ? st.recentMessages : []),
+      ]
+        .slice(-6)
+        .map((m) => String(m?.text ?? m?.plain ?? ''));
+      if (triggerWantsRecall(recallTexts)) {
+        const rc = recallColdStorage({
+          dir: path.join(STATE_DIR, 'memory', key.replace(':', '_')),
+          texts: recallTexts,
+        });
+        if (rc.block) {
+          parts.push(rc.block);
+          parts.push('');
+          log(`[recall] ${key} 注入往事 ${rc.hits.length} 条（${rc.block.length} 字）：${rc.hits.map((h) => h.time).join(' / ')}`);
+        }
+      }
+    } catch (error) {
+      log('[recall] 检索失败（不影响这轮）: ' + (error?.message ?? error));
+    }
     // 主动机会：以前 proactiveCheck 一天都没触发过一次（idle 要 15 分钟 + 概率 0.3 + 各种折扣），
     // 所以她从来不会自己冒一句。现在告诉模型「这是可以主动开口的时机」。
     if (reason === 'proactiveCheck' || reason === 'timeout') {
@@ -8360,6 +8431,13 @@ async function main() {
       parts.push(research.source === 'kb' ? '【本地知识库（之前搜过的结果）】' : '【刚搜到的结果】');
       parts.push(String(research.text).slice(0, 1200));
       parts.push('（按这些内容回答，别念来源、别说"我查了知识库"，像本来就知道一样）');
+      parts.push('');
+    }
+    // 她自己说「这个我不懂/想不起来」→ 翻旧记录翻到了，带着结果重说一次
+    if (sweep && sweep.block) {
+      parts.push('【你刚才想不起来，翻了一下群里的旧记录，翻到这些】');
+      parts.push(String(sweep.block));
+      parts.push('（按这些回答。还是没有的话就照实说记不清了，别编）');
       parts.push('');
     }
     if (st.attackMode === true) {
@@ -8482,7 +8560,7 @@ async function main() {
     }
     const hadImages = Array.isArray(imageParts) && imageParts.length > 0;
     // 带图的这一轮：她容易把图当背景，直接接上一个话题抖机灵（2026-10-22 实测：
-    // 某群友发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
+    // 群友A发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
     const imgHint = visionParts && visionParts.length
       ? '\n（这轮带了图：先看清图里到底是什么东西、写了什么字，再决定说什么。别没看就接上一个话题。）'
       : '';
@@ -8491,7 +8569,7 @@ async function main() {
     }
     const imgNote = hadImages && !visionParts.length ? '\n（这轮本来带了图，但图没取到，别硬编图里有什么）' : '';
     // 多张图一起塞进去时她分不清哪张是谁的 —— 2026-10-23 实测：群里同时有「B站视频抽帧图」
-    // 和「某群友发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
+    // 和「群友A发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
     // 所以按顺序编号，并点明哪一张是视频。
     let multiNote = '';
     if (visionParts.length > 1) {
@@ -8571,7 +8649,7 @@ async function main() {
   /** 执行模型给的动作：发送、发表情、收尾。 */
   // ── 上下文标记泄漏（2026-10-22 主人在群里当场看到两条） ────────────────
   // 她有时候把「【主人】」「昵称(QQ号)：」「你：」这些**上下文的格式**当成发言内容发出去，
-  // 群里变成「【主人】原来是10月啊」「【主人】主人({{OWNER_QQ}})：「这人最精了」」。
+  // 群里变成「【主人】原来是10月啊」「【主人】{{OWNER_NAME}}({{OWNER_QQ}})：「这人最精了」」。
   // 那是我们喂给她的排版，不是她该说的话 —— 发出去前统一剥掉。
   function cleanLiteReplyText(text, st) {
     let s = String(text ?? '').trim();
@@ -8708,7 +8786,7 @@ async function main() {
           if (actions.replyTo !== undefined && actions.replyTo !== null && String(actions.replyTo).trim() !== '') {
             const rawReplyTo = String(actions.replyTo).trim();
             // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（2026-10-22 实测填过
-            // 「。(<群友QQ>)」，于是 replyTo 解析失败、该引用的没引用）。
+            // 「。(123456789)」，于是 replyTo 解析失败、该引用的没引用）。
             // 所以先把它拆成昵称 / 号码两种写法各试一遍。
             const cands = [rawReplyTo];
             const m = rawReplyTo.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);
@@ -9055,13 +9133,13 @@ async function main() {
   }
 
   /** 精简模式的完整一轮：拼上下文 → 一次 API 调用 → 执行动作。 */
-  async function deliverLiteV2(key, reason, media = [], research = null) {
+  async function deliverLiteV2(key, reason, media = [], research = null, sweep = null) {
     const lc = liteConfig();
     if (!lc.enabled) throw new Error('精简模式未开启');
     const st = getSocialV2State(key);
     const snapshot = buildWakeSnapshotV2(key);
     const systemPrompt = buildLiteSystemPrompt();
-    const userText = buildLiteUserMessage(key, reason, snapshot, research);
+    const userText = buildLiteUserMessage(key, reason, snapshot, research, sweep);
     const imageParts = Array.isArray(media) && media.length ? await resolveMediaList(media) : [];
     // 这一轮要是有视频（QQ 视频消息 或 消息里的 B 站链接），抽一张帧拼图放在最前面。
     // 放在前面是因为 callLiteApi 只取前 3 张图，视频内容才是这轮的重点。
@@ -9080,6 +9158,28 @@ async function main() {
     const started = Date.now();
     const result = await callLiteApi(lc, systemPrompt, userText, imageParts);
     const actions = parseLiteActions(result.text);
+    // 她自己说「这个我不懂/想不起来」并给了关键词：先翻旧记录（本地、0 成本），
+    // 翻到了就带着往事重说一次。只重试一次，第二次无论有没有都不再触发。
+    if (!sweep) {
+      const askRecall = (Array.isArray(actions.recall) ? actions.recall.join(' ') : String(actions.recall ?? '')).trim().slice(0, 60);
+      if (askRecall && !/^(null|undefined|none|无|没有|空)$/i.test(askRecall)) {
+        try {
+          const rc = recallColdStorage({
+            dir: path.join(STATE_DIR, 'memory', key.replace(':', '_')),
+            texts: [askRecall],
+            span: 12,
+            maxChars: 2600
+          });
+          if (rc.block) {
+            log(`[recall] ${key} 她想不起来「${askRecall.slice(0, 30)}」→ 翻到 ${rc.hits.length} 段旧记录，重说一次`);
+            return deliverLiteV2(key, reason, media, research, { ask: askRecall, block: rc.block });
+          }
+          log(`[recall] ${key} 她想不起来「${askRecall.slice(0, 30)}」→ 旧记录里没有`);
+        } catch (error) {
+          log('[recall] 自查检索失败（不影响这轮）: ' + (error?.message ?? error));
+        }
+      }
+    }
     // 先登记「这一轮给模型看过哪些消息」，再算水位。
     // 不登记的话 modelSeenSeqs 是空的 ⇒ readThroughSeqV2() 算出 0 ⇒ 收尾传任何真实水位
     // 都会被判「超过已展示连续消息水位」而拒绝（实测 markThroughError、unread 卡住 9 条）。
@@ -11165,16 +11265,24 @@ async function main() {
     // 与「部分表情 20 秒超时」的根因）；丢了 summary，模型只看到「[图片1]」而不是「[表情:给你糖吃]」；
     // kind 被拍平还会让 mface（市场表情）被当成普通图片。
     const safeMedia = Array.isArray(media) ? media.map((m) => {
-      const kind = m?.kind === 'face' ? 'face' : (m?.kind === 'sticker' ? 'sticker' : 'image');
+      // kind 以前只保留 face/sticker，其余全拍平成 image —— extractMediaFromSegments 明明
+      // 识别成了 video，存进来变成 image，findVideoSourceV2 找 kind==='video' 永远落空，
+      // 「发现视频→抽帧」那一步从来没被触发过（2026-10-25 用真实视频消息实测出来的）。
+      const kind = ['face', 'sticker', 'video', 'file', 'card'].includes(m?.kind) ? m.kind : 'image';
       const item = { kind };
       if (m?.file) item.file = String(m.file);
       if (m?.url) item.url = String(m.url);
       if (m?.faceId) item.faceId = String(m.faceId);
       if (m?.emojiId) item.emojiId = String(m.emojiId);
+      if (m?.fileId) item.fileId = String(m.fileId);
+      if (m?.name) item.name = String(m.name);
+      if (Number(m?.size) > 0) item.size = Number(m.size);
+      if (Number(m?.duration) > 0) item.duration = Number(m.duration);
+      if (m?.raw) item.raw = sanitizeMediaSummary(m.raw, 200);
       if (m?.summary) item.summary = sanitizeMediaSummary(m.summary);
       if (m?.subType) item.subType = String(m.subType);
       return item;
-    }).filter((m) => (m.kind === 'face' ? !!m.faceId : !!(m.file || m.url || m.emojiId))) : [];
+    }).filter((m) => (m.kind === 'face' ? !!m.faceId : !!(m.file || m.url || m.emojiId || m.raw))) : [];
     const safeForwardIds = (Array.isArray(forwardIds) ? forwardIds : []).map(sanitizeForwardId).filter(Boolean);
     if (safeForwardIds.length) {
       let set = seenForwardIds.get(key);
@@ -11737,6 +11845,86 @@ async function main() {
   }
 
   /** 把一个视频（本地路径或 URL）变成一张抽帧拼图，失败返回 null。 */
+  // 视频预取：QQ 媒体直链带 rkey，过几分钟就 "download url has expired"。
+  // 收到消息时先抓到 state/videocache/，唤醒时抽帧直接读本地，不受时效影响。
+  const VIDEO_CACHE_DIR = path.join(STATE_DIR, 'videocache');
+  function videoCachePath(media) {
+    // 种子优先用文件名：QQ 的 media.url 里带 rkey，每次分享都不一样，
+    // 拿它当种子会导致同一条视频回回都重新下载（2026-10-25 实测多下了一份 3952KB）。
+    const seed = String(media?.file || '').trim() || String(media?.url || '').split('?')[0];
+    const h = crypto.createHash('sha1').update(seed).digest('hex').slice(0, 16);
+    return path.join(VIDEO_CACHE_DIR, h + '.mp4');
+  }
+  function cachedVideoPath(media) {
+    try {
+      const p = videoCachePath(media);
+      if (fs.existsSync(p) && fs.statSync(p).size > 1024) return p;
+    } catch { /* 读不到就当没有 */ }
+    return '';
+  }
+  function pruneVideoCache(maxBytes = 300 * 1024 * 1024, maxAgeMs = 3 * 86400000) {
+    try {
+      if (!fs.existsSync(VIDEO_CACHE_DIR)) return;
+      const now = Date.now();
+      const items = [];
+      let total = 0;
+      for (const f of fs.readdirSync(VIDEO_CACHE_DIR)) {
+        const p = path.join(VIDEO_CACHE_DIR, f);
+        const st = fs.statSync(p);
+        if (now - st.mtimeMs > maxAgeMs) { fs.unlinkSync(p); continue; }
+        items.push({ p, size: st.size, mtime: st.mtimeMs });
+        total += st.size;
+      }
+      items.sort((a, b) => a.mtime - b.mtime);
+      while (total > maxBytes && items.length) {
+        const it = items.shift();
+        try { fs.unlinkSync(it.p); total -= it.size; } catch { /* 删不掉就算了 */ }
+      }
+    } catch { /* 清理失败不影响主流程 */ }
+  }
+  async function prewarmVideo(media) {
+    try {
+      if (!media || media.kind !== 'video' || !media.url) return '';
+      const has = cachedVideoPath(media);
+      if (has) return has;
+      fs.mkdirSync(VIDEO_CACHE_DIR, { recursive: true });
+      pruneVideoCache();
+      const out = videoCachePath(media);
+      const r = await downloadDirect(media.url, out);
+      if (r.ok) {
+        log('[video] 预下载完成 ' + Math.round(r.bytes / 1024) + 'KB —— 唤醒时直接抽帧，不怕 rkey 过期');
+        return out;
+      }
+      log('[video] 预下载失败：' + r.error + '（唤醒时还会再试一次）');
+      return '';
+    } catch (error) {
+      log('[video] 预下载异常：' + (error?.message ?? error));
+      return '';
+    }
+  }
+
+  /** 直链下载（QQ 媒体 CDN 用的是带 rkey 的临时链接，fetch 一次就够，别绕 yt-dlp）。 */
+  async function downloadDirect(url, outPath) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+          referer: 'https://qun.qq.com/'
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(120000)
+      });
+      if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 1024) return { ok: false, error: '文件太小 ' + buf.length + 'B' };
+      if (buf.length > 120 * 1024 * 1024) return { ok: false, error: '文件太大 ' + Math.round(buf.length / 1048576) + 'MB' };
+      fs.writeFileSync(outPath, buf);
+      return { ok: true, path: outPath, bytes: buf.length };
+    } catch (error) {
+      return { ok: false, error: error?.message ?? String(error) };
+    }
+  }
+
   async function videoToSheet(source, opts = {}) {
     const cols = Number(opts.cols) || 2;
     const rows = Number(opts.rows) || 3;
@@ -11753,24 +11941,44 @@ async function main() {
         if (got?.path) { videoPath = got.path; via = 'bilibili-api'; videoTitle = got.title || ''; }
         else return null;
       } else if (isRemote) {
-        // 只下 480p 以内：看得清画面就行，2C2G 的机器经不起大文件
         videoPath = path.join(workDir, 'video.mp4');
-        const dl = await runCmd('yt-dlp', [
-          '-f', 'best[height<=480]/best', '--no-playlist', '--no-warnings',
-          '--max-filesize', '80M', '-o', videoPath, source
-        ], 180000);
-        if (!dl.ok || !fs.existsSync(videoPath)) {
-          log('[video] 下载失败：' + (dl.stderr || dl.error).split('\n').slice(-1)[0]);
-          return null;
+        // QQ 自己的媒体直链直接 fetch 最稳（yt-dlp 对带 rkey 的 CDN 链接常常抓不动）
+        const direct = await downloadDirect(source, videoPath);
+        if (direct.ok) {
+          via = 'direct';
+        } else {
+          log('[video] 直链抓取失败（' + direct.error + '），改用 yt-dlp');
+          // 只下 480p 以内：看得清画面就行，2C2G 的机器经不起大文件
+          const dl = await runCmd('yt-dlp', [
+            '-f', 'best[height<=480]/best', '--no-playlist', '--no-warnings',
+            '--max-filesize', '80M', '-o', videoPath, source
+          ], 180000);
+          if (!dl.ok || !fs.existsSync(videoPath)) {
+            log('[video] 下载失败：' + (dl.stderr || dl.error).split('\n').slice(-1)[0]);
+            return null;
+          }
+          via = 'yt-dlp';
         }
       }
       if (!fs.existsSync(videoPath)) return null;
       const size = fs.statSync(videoPath).size;
       if (size > 120 * 1024 * 1024) { log('[video] 文件太大，跳过：' + Math.round(size / 1048576) + 'MB'); return null; }
+      // 先量时长：固定「10 秒一帧 + 2x3」遇到短视频会剩黑格，遇到长视频又会漏看后面
+      let duration = 0;
+      try {
+        const probe = await runCmd('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', videoPath], 20000);
+        duration = Number(String(probe.stdout || '').trim()) || 0;
+      } catch { /* 拿不到时长就按默认走 */ }
+      const wantFrames = cols * rows; // 默认 6 格
+      const interval = duration > 0 ? Math.max(2, Math.round(duration / wantFrames)) : everySec;
+      const frames = duration > 0 ? Math.min(wantFrames, Math.max(1, Math.ceil(duration / interval))) : wantFrames;
+      const tileCols = frames <= 2 ? frames : (frames <= 4 ? 2 : 3);
+      const tileRows = Math.ceil(frames / tileCols);
+      log('[video] 时长 ' + Math.round(duration || 0) + 's → 每 ' + interval + ' 秒一帧 × ' + frames + ' 帧（' + tileCols + 'x' + tileRows + '）');
       const sheetPath = path.join(workDir, 'sheet.jpg');
       const ff = await runCmd('ffmpeg', [
         '-hide_banner', '-v', 'error', '-nostdin', '-y', '-i', videoPath,
-        '-vf', 'fps=1/' + everySec + ',scale=480:-2,tile=' + cols + 'x' + rows,
+        '-vf', 'fps=1/' + interval + ',scale=480:-2,tile=' + tileCols + 'x' + tileRows,
         '-frames:v', '1', '-q:v', '4', sheetPath
       ], 180000);
       if (!ff.ok || !fs.existsSync(sheetPath)) {
@@ -11779,11 +11987,11 @@ async function main() {
       }
       const buffer = fs.readFileSync(sheetPath);
       if (!buffer.length) return null;
-      log('[video] 抽帧完成（' + via + '，' + Math.round(size / 1024) + 'KB → ' + Math.round(buffer.length / 1024) + 'KB，每 ' + everySec + ' 秒一帧）');
+      log('[video] 抽帧完成（' + via + '，' + Math.round(size / 1024) + 'KB → ' + Math.round(buffer.length / 1024) + 'KB，每 ' + interval + ' 秒一帧）');
       return {
         buffer,
         mimeType: 'image/jpeg',
-        note: '视频抽帧联系表（每 ' + everySec + ' 秒一帧）' + (videoTitle ? '｜视频标题：' + videoTitle.slice(0, 60) : '')
+        note: '视频抽帧联系表（每 ' + interval + ' 秒一帧，共 ' + frames + ' 张）' + (videoTitle ? '｜视频标题：' + videoTitle.slice(0, 60) : '')
       };
     } catch (error) {
       log('[video] 异常：' + (error?.message ?? error));
@@ -11803,12 +12011,44 @@ async function main() {
       if (!m || m.isSelf) continue;
       const media = Array.isArray(m.media) ? m.media : [];
       for (const md of media) {
-        if (md && md.kind === 'video' && (md.url || md.file)) return { source: md.url || md.file, kind: 'qq-video' };
+        if (!md) continue;
+        // 视频段：有 url 就用 url；file 只有像绝对路径时才敢当本地文件（否则那只是个文件名）
+        if (md.kind === 'video') {
+          const cached = cachedVideoPath(md);
+          if (cached) return { source: cached, kind: 'qq-video-cache' };
+          const local = /^[/\\]/.test(String(md.file || '')) ? String(md.file) : '';
+          if (md.url || local) return { source: md.url || local, kind: 'qq-video' };
+        }
+        // 分享卡片里的视频链接（B 站 / 抖音 / 腾讯视频）
+        if (md.kind === 'card' && md.url && /b23\.tv|bilibili\.com|youtu|douyin|ixigua|v\.qq\.com|\.mp4/i.test(md.url)) {
+          return { source: md.url, kind: 'card' };
+        }
       }
       const hit = String(m.text || m.plain || '').match(VIDEO_URL_RE);
       if (hit) return { source: hit[1], kind: 'link' };
     }
     return null;
+  }
+
+  /** 收到视频/文件/卡片时留一行诊断：真实字段结构只有见到才知道，别靠猜。 */
+  function logMediaProbe(key, mediaList) {
+    try {
+      for (const md of Array.isArray(mediaList) ? mediaList : []) {
+        if (!md || !['video', 'file', 'card'].includes(md.kind)) continue;
+        log(`[media] ${key} 收到 ${md.kind}：` + JSON.stringify({
+          url: String(md.url || '').slice(0, 120),
+          file: String(md.file || '').slice(0, 80),
+          fileId: md.fileId || '',
+          name: md.name || '',
+          size: md.size || 0,
+          duration: md.duration || 0,
+          crawlable: !!md.url,
+          raw: md.raw ? String(md.raw).slice(0, 120) : ''
+        }));
+        // 趁 URL 还新鲜，先把文件抓到本地（不等它，别拖慢消息处理）
+        if (md.kind === 'video' && md.url) void prewarmVideo(md);
+      }
+    } catch { /* 诊断日志不许影响主流程 */ }
   }
 
   function collectWakeMediaV2(st, limit = 3, opts = {}) {
@@ -12341,6 +12581,22 @@ async function main() {
     if (!Number.isFinite(until)) return;
     const delay = until - Date.now();
     if (delay <= 0) {
+      // 睡过头超过 10 分钟 = 中间 bridge 停过（每天 04:00 归档必重启一次）。
+      // 这时候补唤醒会在凌晨莫名冒泡，改成重新计一段，等她下次真的该醒再说。
+      const overdueMs = -delay;
+      if (overdueMs > 10 * 60000) {
+        const minMs = Math.max(5 * 60000, Number(cfg.socialV2?.wake?.recommendedSleepMinMs) || 300000);
+        const ms = Math.round(Math.min(45 * 60000, Math.max(minMs, 45 * 60000)));
+        wc.sleepUntil = new Date(Date.now() + ms).toISOString();
+        try { saveSocialV2State(); } catch {}
+        log(`[reserved2] ${key} 睡眠已过期 ${Math.round(overdueMs / 60000)} 分钟（中途重启过），重新计 ${Math.round(ms / 60000)} 分钟，不补唤醒`);
+        st.sleepTimer = setTimeout(() => {
+          st.sleepTimer = null;
+          void sendWakePromptV2(key, 'timeout').catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+        }, ms);
+        st.sleepTimer.unref?.();
+        return;
+      }
       void sendWakePromptV2(key, 'timeout').catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
       return;
     }
@@ -12636,6 +12892,7 @@ async function main() {
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     let plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
+    logMediaProbe(key, mediaList);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
@@ -12819,7 +13076,7 @@ async function main() {
           scheduleWakeV2(key, reason);
         }
       }
-      appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);
+      appendActivity(`${key} [reserved2] 消息已入未读 [${sender}(${event.user_id ?? ''})]：${textContent.slice(0, 80)}`);
       return;
     }
 

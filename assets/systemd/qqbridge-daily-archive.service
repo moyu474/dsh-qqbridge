@@ -1,0 +1,12 @@
+[Unit]
+Description=qq-bridge 每日归档（群聊原文冷存储 + 开新会话）
+After=qqbridge.service
+Wants=qqbridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/daily-archive.sh
+TimeoutStartSec=300
+# 归档脚本自己会 systemctl restart qqbridge，这里只管跑完就算成功
+SuccessExitStatus=0

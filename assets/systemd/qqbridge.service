@@ -1,0 +1,17 @@
+[Unit]
+Description=qq-bridge (SnowLuma <-> DSH)
+After=network.target docker.service dsh-web.service
+Wants=docker.service
+
+[Service]
+EnvironmentFile=__ENV_FILE__
+Type=simple
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/node __INSTALL_DIR__/src/bridge.js
+Restart=always
+RestartSec=5
+StandardOutput=append:__INSTALL_DIR__/bridge.log
+StandardError=append:__INSTALL_DIR__/bridge.log
+
+[Install]
+WantedBy=multi-user.target

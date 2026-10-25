@@ -1,0 +1,11 @@
+[Unit]
+Description=每天 04:00 归档 qq-bridge 群聊并开新会话
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=0
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

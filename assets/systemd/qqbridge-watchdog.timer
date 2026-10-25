@@ -1,0 +1,10 @@
+[Unit]
+Description=每 30 分钟检查一次 qq-bridge 是否在线
+
+[Timer]
+OnCalendar=*:0/30
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

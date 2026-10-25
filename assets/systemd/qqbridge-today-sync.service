@@ -1,0 +1,11 @@
+[Unit]
+Description=qq-bridge 当天滚动临时库（把最近一次 04:00 起的群聊原文写进 today.jsonl）
+After=qqbridge.service
+Wants=qqbridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/node __INSTALL_DIR__/sync-today.mjs
+TimeoutStartSec=60
+Nice=10

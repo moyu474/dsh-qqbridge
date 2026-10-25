@@ -1,0 +1,9 @@
+[Unit]
+Description=qq-bridge 掉线看门狗（独立于 bridge 进程，挂了也能报警）
+After=qqbridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/watchdog.sh
+TimeoutStartSec=120
