@@ -10,7 +10,7 @@
     "allowRemote": false
   },
   "role": {
-    "maxInjectChars": 6000
+    "maxInjectChars": 12000
   },
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
@@ -242,7 +242,7 @@
       "notifyOwnerOnError": false
     },
     "context": {
-      "recentLimit": 100,
+      "recentLimit": 200,
       "unreadLimit": 30,
       "contextWindow": 20,
       "inlineWakeMessages": true,

@@ -60,14 +60,15 @@ export function senderKey(text) {
  * 已知发送者清单：social-v2.json 的最近 40 条 + lite-turns.jsonl 里近 300 轮的上下文原文
  * （每轮 ctx 都带着「昵称(QQ号)：内容」）。用来给「旧格式没昵称」的 activity.log 行补人。
  */
-export function knownSenders(root) {
+export function knownSenders(root, key = '') {
   const stateDir = path.join(root, 'state');
   const out = [];
 
   // 1. social-v2：结构化，最准
   try {
     const j = JSON.parse(fs.readFileSync(path.join(stateDir, 'social-v2.json'), 'utf8'));
-    for (const c of Object.values(j?.conversations || {})) {
+    for (const [k, c] of Object.entries(j?.conversations || {})) {
+      if (key && k !== key) continue;
       for (const m of Array.isArray(c?.recentMessages) ? c.recentMessages : []) {
         if (!m || !m.text) continue;
         out.push({
@@ -89,6 +90,9 @@ export function knownSenders(root) {
       let turn;
       try { turn = JSON.parse(line); } catch { continue; }
       const t = Number(turn.t) || 0;
+      // 私聊和群聊的 ctx 会混在同一个文件里，补昵称时必须按会话分开，
+      // 否则会拿 A 群的人名去补 B 群（或私聊）的旧行。
+      if (key && turn.key && String(turn.key) !== key) continue;
       for (const ln of String(turn.ctx || '').split('\n')) {
         const m = ln.match(/^(?:【主人】)?([^：:\n]{1,30})\((\d{5,12})\)[：:](.+)$/);
         if (!m) continue;
@@ -101,6 +105,27 @@ export function knownSenders(root) {
 }
 
 /**
+ * 列出所有需要归档/同步的会话（2026-10-26）。
+ * 来源两处取并集：social-v2.json 的 conversations（权威）+ activity.log 里出现过的 key（兜底，
+ * 防止某个会话刚好被清过状态就漏掉）。只认 group:数字 / private:数字。
+ */
+export function listSessions(root) {
+  const stateDir = path.join(root, 'state');
+  const keys = new Set();
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(stateDir, 'social-v2.json'), 'utf8'));
+    for (const k of Object.keys(j?.conversations || {})) {
+      if (/^(?:group|private):\d+$/.test(k)) keys.add(k);
+    }
+  } catch { /* 没有就算了 */ }
+  try {
+    const raw = fs.readFileSync(path.join(stateDir, 'qq-activity.log'), 'utf8');
+    for (const m of raw.matchAll(/\b((?:group|private):\d{5,12})\b/g)) keys.add(m[1]);
+  } catch { /* 没有就算了 */ }
+  return [...keys].sort();
+}
+
+/**
  * 采一段周期里的原文。
  * @param {object} o
  * @param {string} o.root          qq-bridge 根目录
@@ -109,11 +134,12 @@ export function knownSenders(root) {
  * @param {number} [o.endMs]       右界，默认现在
  * @returns {Array<{date:string,hms:string,ts:number,who:string,text:string}>}
  */
-export function collectMessages({ root, gid = DEFAULT_GID, startMs, endMs = Date.now() } = {}) {
+export function collectMessages({ root, gid = DEFAULT_GID, key = '', startMs, endMs = Date.now() } = {}) {
   const stateDir = path.join(root, 'state');
   const ACT = path.join(stateDir, 'qq-activity.log');
   const TOOL = path.join(stateDir, 'tool-calls.jsonl');
-  const KEY = `group:${gid}`;
+  // key 优先（支持 private:QQ号）；只给 gid 时退回群聊
+  const KEY = String(key || '').trim() || `group:${gid}`;
   const rows = [];
   const seen = new Set();
 
@@ -132,7 +158,9 @@ export function collectMessages({ root, gid = DEFAULT_GID, startMs, endMs = Date
   //    今天之前的旧行只有 `消息已入未读：正文`，靠下面 social-v2 的最近 40 条尽量补。
   if (fs.existsSync(ACT)) {
     for (const line of fs.readFileSync(ACT, 'utf8').split('\n')) {
-      const m = line.match(/^\[(\d{2}):(\d{2}):(\d{2})\] (group:\d+) .*?消息已入未读(?: \[([^\[\]]+)\])?[：:](.*)$/);
+      // 2026-10-26：原来只认 group:，私聊的行（private:QQ号）全被丢掉，
+      // 所以私聊永远没有归档。改成 group|private 都认，按 key 精确比对。
+      const m = line.match(/^\[(\d{2}):(\d{2}):(\d{2})\] ((?:group|private):\d+) .*?消息已入未读(?: \[([^\[\]]+)\])?[：:](.*)$/);
       if (!m || m[4] !== KEY) continue;
       const hms = `${m[1]}:${m[2]}:${m[3]}`;
       let who = '群友';
@@ -172,7 +200,7 @@ export function collectMessages({ root, gid = DEFAULT_GID, startMs, endMs = Date
   // 3. 旧格式补昵称：今天之前的 activity.log 行没保存发送者，全显示「群友」，
   //    检索注入回去她分不清谁说的。用已知发送者清单按「正文前缀唯一匹配」补上 ——
   //    同一条内容如果不同的人都说过，就宁可不补（错配比缺更误导）。
-  const known = knownSenders(root);
+  const known = knownSenders(root, KEY);
   if (known.length) {
     const index = new Map();
     for (const s of known) {

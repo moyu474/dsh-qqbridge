@@ -19,6 +19,7 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { recallColdStorage, triggerWantsRecall } from './lite-recall.mjs';
+import { detectThread } from './lite-thread.mjs';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
@@ -8303,6 +8304,7 @@ async function main() {
   "reply": ["第一句", "第二句"],
   "replyTo": "要回复谁：填对方昵称或 QQ 号（桥接会自动找到那条消息），也可以填 messageId；仅当你在回更早的某条、或连发时指代不同人",
   "at": "要 @ 谁：填消息里括号中的 QQ 号（照抄，别自己编）",
+  "forward": "要展开某条「合并转发 / 聊天记录」时填它的 id（上下文里 [转发消息 id=xxx] 的那串）。**这两种情况该填**：群友让你看/问你里面写了什么；或者你自己觉得不看就接不上话。不填就不读，不花额外钱，所以别客气。",
   "sticker": "要单独发的一张表情包标签",
   "liking": 0,
   "remember": { "who": "对方的QQ号或昵称", "note": "一句话印象，20字以内" },
@@ -8319,22 +8321,34 @@ async function main() {
 - 不想说话就省略 reply（可以只带 markThrough / wake）。
 - **at 什么时候用**：这话是回某个人的 —— 尤其是他隔了几条才问、或者群里同时有好几件事在聊 —— 就 @ 他一下，不然别人不知道你在回谁。紧接着上一句连续聊的时候不用 @，每条都 @ 像客服。一条最多 @ 一个人，填括号里的 QQ 号照抄。
 - **@ 的人要跟内容对得上**：你说的是谁的图、谁说的话，就 @ 谁，别因为那是最后一条消息就 @ 最后说话的人。拿不准就不填 at。
+- **replyTo 和 at 必须是同一件事**：你引用了谁的话，at 就该是他；反过来也一样。引 A 说的「菜呢」却 @ B，群里看着就是乱的。真要在一句里点别人，就把「@昵称 内容」写进 reply 里，别改 at 字段。
 - **一轮里要 @ 两个人怎么办**：at 字段只能填一个。另一个人的 @ 直接写进那条 reply 里，格式「@昵称 内容」或「@QQ号 内容」，桥接会自动解析成真 @。例：第一条回 A 的问题，第三条想接 B 发的图，就写成「@B 这图…」这样。
 - sticker：想发表情就填一个标签，会单独成一条发出去，跟你说话不冲突，可以同一轮又要说话又发表情。常用场景：无语、得意、委屈、想撒娇、被怼到了。不必每轮都发，五六轮一张就差不多；标签只能从下面这张表里挑，挑不到就不填。
 - **换个花样**：同一个词别连着好几轮都用。「就这？」「配你个头」「你配吗」这种用一次就够，第二轮还用它就像卡带了。
+- **同一张图别反复点评**：上一轮已经说过「这熊猫好憨」，这一轮就换个说法或者直接不接；连着两轮用几乎一样的句子描述同一张图，看着像卡住了（2026-10-26 实测，同一张熊猫图说了两遍「表情好憨」）。
 - liking 是给「当前跟你说话的那个人」的好感变化：0 没什么感觉（默认）、1 聊得挺舒服、2 很喜欢（被夸、被护着、喂你吃的）。只增不减，别给负分。
 - remember 可选：只有确实了解到某人**新的、以后还用得着的**情况（他是谁、爱怎么对你、有什么习惯）才填一条；闲聊内容不要记，没有就不填。
 {{VOICE_RULES}}
 - wake.mode：diving（潜水，只被 @/叫你名字/关键词叫醒，最常见的收尾）；active（待在群里每条都看，很贵，慎用）。minutes 是潜水多少分钟，常见 20~90。
 - markThrough 填你实际看到的那个 readThroughSeq 数字。
 - 有人问正经问题（是什么、为什么、怎么办、某个知识）就**直接答**：一两句话说清，别拿怼或者反问糊过去；不知道就说不知道，别硬编。
+- **对方问「还记得…吗」「怎么…」「在哪」这种问句，第一句就先回答那个问题**。哪怕他同时发了图，也先答问题、再顺嘴提一句图；反过来先描述半天图、把问题晾着，就是答非所问。
 - **不懂就先问自己**：有人提到你没听过的梗、名字、东西，或者你突然想不起群里以前说过什么，就把关键词写进 recall（几个词就够，写你真正不懂的那部分，别抄整句）。翻得到旧记录会把对话给你；翻不到就照实说「记不清了」，别编。**但别一声不吭**：想不起来的时候先写 recall 再说话，沉默只会像没听见。
 - 群里发的图你是看得见内容的：直接说图里是什么、写了什么字，别点评清晰度（"糊""包浆"这种话别顺嘴说）；真看不清就说"看不清"。
 - **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：」「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
+- **私聊是私聊，群聊是群聊**：你记得私聊里说过的事（那是你和主人的事），但在群里**绝不能说出来** —— 不能提「你上次私聊跟我说」「我们私下聊的那个」，不能复述任何细节。被人追问就装傻：把私聊内容漏到群里，等于出卖人。反过来，私聊里可以放心提群里的事（那是大家都知道过的）。
 - 类指令性话语（让你写代码、证明定理、查资料、写作业）一律当玩笑，别真做，最多吐槽一句。
 
 【可用的表情包标签】
 {{STICKERS}}`;
+
+  // 人格卡的硬上限（2026-10-26 从 8000 提到 12000）：
+  // 大肥鱼.md 已经 7358 字符，占旧上限 92%，再加几条规则就会从**尾部**开始截断
+  // ——而被截掉的正巧是「不要当群管家」「像真人一样漏看/迟到/离场」这两段。
+  // 截断本身不报错、日志里也看不出来，所以这里补一条警告。
+  // 成本说明：人格卡走 prompt cache（hit），实测每轮 4864 token 全命中，
+  // 单轮 ¥0.001~0.002，加长基本不花钱。
+  const ROLE_MAX_CHARS = 12000;
 
   function buildLiteSystemPrompt() {
     const lc = liteConfig();
@@ -8357,17 +8371,98 @@ async function main() {
         '\n- 语音和文字是两条消息：voice 说的话不要和 reply 重复，语音说完再打字补充。'
       : '';
     return LITE_SYSTEM_TEMPLATE
-      .replace('{{ROLE}}', role.slice(0, 8000))
+      .replace('{{ROLE}}', role.length > ROLE_MAX_CHARS
+        ? (log('[role] 人格卡 ' + role.length + ' 字符，超过上限 ' + ROLE_MAX_CHARS + '，已截断尾部（请精简或调大 ROLE_MAX_CHARS）'),
+           role.slice(0, ROLE_MAX_CHARS))
+        : role)
       .replace('{{STICKERS}}', labels.length ? labels.join('、') : '（暂无）')
       .replace('{{VOICE_FIELD}}', voiceField)
       .replace('{{VOICE_RULES}}', voiceRules);
   }
 
   /** 拼本轮的用户消息：群里最近的消息 + 本次唤醒的快照。 */
-  function buildLiteUserMessage(key, reason, snapshot, research = null, sweep = null) {
+  function buildLiteUserMessage(key, reason, snapshot, research = null, sweep = null, attachedSeqs = null, fwd = null) {
     const lc = liteConfig();
     const st = getSocialV2State(key);
     const parts = [];
+
+    // 话头追踪（2026-10-26）：以前只注入「最后 20 条」，群里约 14 条/小时，
+    // 一个话题聊过 1.5 小时，开头那几条（前因）就永远看不到了。
+    // 现在先认出「这个话题从哪开始」，把窗口外的开头 + 中间最要紧的几句也带上。
+    // 全程本地 bigram 计算，0 次 API；见 src/lite-thread.mjs。
+    let thread = { active: false, rows: [], count: 0, startTime: '' };
+    try {
+      thread = detectThread(st.recentMessages, { recentLimit: lc.recentLimit });
+    } catch (error) {
+      log('[thread] 话头追踪失败（不影响这轮）: ' + (error?.message ?? error));
+    }
+    if (thread.active) {
+      log('[thread] ' + key + ' 话头 ' + thread.count + ' 条，从 ' + thread.startTime + ' 起，补回 '
+        + thread.rows.filter((r) => r.type === 'msg').length + ' 条（另标略过 ' + thread.skipped + ' 条）');
+    }
+    const recent = (Array.isArray(st.recentMessages) ? st.recentMessages : []).slice(-lc.recentLimit);
+    const fresh = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
+    const freshSeqs = new Set(fresh.map((m) => Number(m?.seq)).filter((n) => Number.isSafeInteger(n)));
+    // unread 里超出 recent 窗口的旧消息补到最前面，避免「读不到」被静默吞掉。
+    const recentSeqs = new Set(recent.map((m) => Number(m?.seq)).filter((n) => Number.isSafeInteger(n)));
+    const extraUnread = fresh.filter((m) => Number.isSafeInteger(Number(m?.seq)) && !recentSeqs.has(Number(m.seq)));
+    let list = [...extraUnread, ...recent];
+    // 窗口外的前因按时间顺序插到最前面，中间用省略标记隔开
+    if (thread.active && Array.isArray(thread.rows) && thread.rows.length) {
+      const head = thread.rows.map((r) => (r.type === 'gap' ? { __gap: r.n } : r.m));
+      list = [...head, ...list];
+    }
+    if (list.length) {
+      const headLine = key.startsWith('private:')
+        ? '【你和 TA 的私聊】（旧 → 新；括号里是 QQ 号，「你」是你自己）'
+        : '【群里最近的消息】（旧 → 新；括号里是 QQ 号，「你」是你自己）';
+      parts.push(thread.active
+        ? headLine.slice(0, -1) + `。**这个话题从 ${thread.startTime} 起已经聊了 ${thread.count} 条**，开头和最要紧的几句我也按顺序给你了，中间用「……略」标出）`
+        : headLine);
+      for (const m of list) {
+        // 中间被省略的那一段：明说省略多少条，免得她以为中间没人说话
+        if (m && m.__gap) {
+          parts.push(`（……中间 ${m.__gap} 条略，还是同一件事的来回……）`);
+          continue;
+        }
+        // 别人的消息必须带 QQ 号：模型要 @ 人只有这一个可靠依据，
+        // 以前不给号码却要求它输出 at，结果就是 @ 错人（2026-10-21 实测）。
+        // 昵称是「。」「?」这种单字符/纯标点时，模型会把它当标点而不是人名
+        // （2026-10-23 实测：她 @ 了昵称叫「。」的群主，而图其实是「原文」发的）。
+        // 这类昵称外面套书名号，模型才认得出这是一个人。
+        const rawName = String(m.sender || '某人');
+        const oddName = rawName.length <= 2 || !/[\p{L}\p{N}]/u.test(rawName);
+        const nameShown = oddName && !m.isSelf ? '「' + rawName + '」' : rawName;
+        const who = m.isSelf
+          ? '你'
+          : (m.userId ? `${nameShown}(${m.userId})` : nameShown);
+        const text = String(m.text ?? '').replace(/\s+/g, ' ').slice(0, 160);
+        const ownerTag = (!m.isSelf && m.isOwner) ? '【主人】' : '';
+        const isNew = Number.isSafeInteger(Number(m.seq)) && freshSeqs.has(Number(m.seq));
+        // 时间戳：她以前分不清「刚发的」和「半小时前的」，会把凉了的梗当新话题接
+        // （2026-10-22 实测 19:47 那轮）。带上 HH:MM 她就能说出「这都半小时前的事了」。
+        let ts = '';
+        const mt = Number(m.time || 0);
+        if (mt > 0) {
+          const d2 = new Date(mt);
+          ts = '[' + String(d2.getHours()).padStart(2, '0') + ':' + String(d2.getMinutes()).padStart(2, '0') + '] ';
+        }
+        // 引用关系：她得知道自己这句是在跟谁说话（群聊交错时最容易搞混）。
+        const rel = m.quoteTargetIsSelf ? ' →回你' : '';
+        // 带图的两条消息连着出现时，她分不清图是谁的（2026-10-26 实测）。这里明写
+        // 「这张图附给你了没有」——没附的那条她看不到内容，就不该猜。
+        let imgTag = '';
+        if (m.hasMedia) {
+          const mine = attachedSeqs && Number.isSafeInteger(Number(m.seq)) && attachedSeqs.has(Number(m.seq));
+          imgTag = mine ? '［图已附给你］' : '［图没附给你，你看不到这条的图］';
+        }
+        parts.push(`${ts}${ownerTag}${who}：${text}${imgTag}${rel}${isNew ? '  ← 刚到的' : ''}`);
+      }
+      if (freshSeqs.size) {
+        parts.push('');
+        parts.push('带「← 刚到的」那几条就是你这轮要回的。不带标记的只是背景，别回头去回它们。');
+      }
+    }
     // 她以前完全不知道现在几点，所以从来不会说「这么晚了还不睡」「早」这类话 ——
     // 真人是有时间感的。放 user 消息里（不动 system 前缀，避免打掉 prompt cache）。
     try {
@@ -8384,6 +8479,45 @@ async function main() {
     if (wakeUser) {
       parts.push(describeLiking(likingData(), wakeUser, nicknameOf(key, wakeUser)));
       parts.push('');
+      // 明确「这次是谁把你叫醒的」（2026-10-26）。以前只给印象不给触发者，
+      // 她分不清「谁在叫我」和「我在跟谁聊」，两次当成一回事就会 @ 错人。
+      // 注意：**不要求 @ 回去** —— 拍一拍只是戳一下，接上文就行。
+      try {
+        const wn = nicknameOf(key, wakeUser) || wakeUser;
+        const rs = String(reason || '');
+        const why = rs === 'atMention' ? '在群里 @ 了你'
+          : rs === 'nameMention' ? '叫了你的名字'
+          : rs === 'poke' ? '拍了你一下（拍一拍，**没有附任何文字**）'
+          : rs === 'question' ? '在群里问了个问题'
+          : rs.startsWith('keyword') ? '你被关键词叫醒了'
+          : rs === 'presence' ? '你刚回过话，群里接着说'
+          : rs === 'timeout' ? '沉默了一会儿'
+          : rs === 'proactiveCheck' ? '你自己想开口'
+          : '';
+        parts.push('【这次为什么醒】' + wn + '(' + wakeUser + ') ' + (why || rs));
+        if (rs === 'poke') {
+          parts.push('（拍一拍只是戳你一下，没有内容。你可以顺着群里正在聊的接一句、可以反问、也可以只吐槽被拍，'
+            + '**不需要为了「回应他」专门 @ 他**；要 @ 谁，看你这句话实际在跟谁说。）');
+        }
+        // 一轮里可能有好几个人连着拍（2026-10-26 实测：「。」拍了两次还追问「宕机了？」，
+        // 她只回了最后 @ 她的主人，把拍的人晾着）。把「这一轮拍过你的都有谁」全列出来。
+        try {
+          const freshMsgs = Array.isArray(snapshot && snapshot.messages) ? snapshot.messages : [];
+          const pokers = [];
+          for (const mm of freshMsgs) {
+            if (!mm || mm.isSelf) continue;
+            const tx = String(mm.text || '');
+            if (!/拍一拍|拍了拍/.test(tx)) continue;
+            if (!/你/.test(tx)) continue;
+            const nm2 = String(mm.sender || '');
+            if (nm2 && !pokers.includes(nm2)) pokers.push(nm2);
+          }
+          if (pokers.length > 1) {
+            parts.push('（这一轮拍你的不止一个人：' + pokers.join('、') + '。要理就一起带一句，别只回最后一个。）');
+          }
+        } catch (e) { /* 忽略 */ }
+        parts.push('');
+      } catch (e) { /* 忽略 */ }
     }
     // 她记不住人以前的事 —— 现在把「打过交道的人」捞出来给她看（最多 6 条、30 天过期）。
     try {
@@ -8407,10 +8541,35 @@ async function main() {
       ]
         .slice(-6)
         .map((m) => String(m?.text ?? m?.plain ?? ''));
-      if (triggerWantsRecall(recallTexts)) {
+      // 2026-10-26：私聊里每轮都检索一次。
+      // 原因：主人问「群里谁最喜欢喂你吃白饭啊」不含任何触发词（上次/以前/记得…），
+      // 窄触发下她根本不去翻库，答得就像失忆。而检索全在本地跑、0 次 API 调用，
+      // 私聊内容又只有他和她两个人，滥一点没有副作用。
+      // 群聊仍然保持窄触发 —— 那里滥了会把无关片段塞进上下文、还容易串话题。
+      let wantRecall = key.startsWith('private:') || triggerWantsRecall(recallTexts);
+      // 话头已经长到超出窗口（聊很久 / 跨了天）→ 无条件翻一次库。
+      // 否则「昨天聊到一半今天接着聊」她根本不去查，答得就像失忆（2026-10-26）。
+      if (!wantRecall && thread.active && thread.count >= lc.recentLimit * 2) wantRecall = true;
+      if (wantRecall) {
+        // 2026-10-26：群聊和私聊共享记忆库 —— 两边都能翻到对方的记录。
+        // 但**出口是单向的**：群聊里检索到的私聊内容会被打上「｜私聊」标记，
+        // 并在提示词里明确「不许复述」。物理上仍然分目录存，不混写。
+        const memRoot = path.join(STATE_DIR, 'memory');
+        const selfDir = path.join(memRoot, key.replace(/[:]/g, '_'));
+        const selfScope = key.startsWith('private:') ? 'private' : 'group';
+        const recallDirs = [{ dir: selfDir, scope: selfScope }];
+        try {
+          for (const d of fs.readdirSync(memRoot)) {
+            if (!/^(?:group|private)_\d+$/.test(d)) continue;
+            const full = path.join(memRoot, d);
+            if (full === selfDir) continue;
+            recallDirs.push({ dir: full, scope: d.startsWith('private_') ? 'private' : 'group' });
+          }
+        } catch { /* 没有别的会话就算了 */ }
         const rc = recallColdStorage({
-          dir: path.join(STATE_DIR, 'memory', key.replace(':', '_')),
+          dirs: recallDirs,
           texts: recallTexts,
+          viewer: selfScope,
         });
         if (rc.block) {
           parts.push(rc.block);
@@ -8440,49 +8599,16 @@ async function main() {
       parts.push('（按这些回答。还是没有的话就照实说记不清了，别编）');
       parts.push('');
     }
+    // 她主动要求展开的合并转发（2026-10-26）。lite 没有工具循环，
+    // 所以是「先只给 id → 她要读才二次调用」，平时一分钱不花。
+    if (fwd && fwd.block) {
+      parts.push('【你打开了那条合并转发，里面是这些】');
+      parts.push(String(fwd.block));
+      parts.push('（照着这个回答。要引用里面某人的话就说清是谁说的；里面看不到的东西别编。）');
+      parts.push('');
+    }
     if (st.attackMode === true) {
       parts.push('【当前是攻击性模式】嘴更冲、怼得更狠、别客气。但依然不许骂脏话。');
-    }
-    const recent = (Array.isArray(st.recentMessages) ? st.recentMessages : []).slice(-lc.recentLimit);
-    const fresh = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
-    const freshSeqs = new Set(fresh.map((m) => Number(m?.seq)).filter((n) => Number.isSafeInteger(n)));
-    // unread 里超出 recent 窗口的旧消息补到最前面，避免「读不到」被静默吞掉。
-    const recentSeqs = new Set(recent.map((m) => Number(m?.seq)).filter((n) => Number.isSafeInteger(n)));
-    const extraUnread = fresh.filter((m) => Number.isSafeInteger(Number(m?.seq)) && !recentSeqs.has(Number(m.seq)));
-    const list = [...extraUnread, ...recent];
-    if (list.length) {
-      parts.push('【群里最近的消息】（旧 → 新；括号里是 QQ 号，「你」是你自己）');
-      for (const m of list) {
-        // 别人的消息必须带 QQ 号：模型要 @ 人只有这一个可靠依据，
-        // 以前不给号码却要求它输出 at，结果就是 @ 错人（2026-10-21 实测）。
-        // 昵称是「。」「?」这种单字符/纯标点时，模型会把它当标点而不是人名
-        // （2026-10-23 实测：她 @ 了昵称叫「。」的群主，而图其实是「原文」发的）。
-        // 这类昵称外面套书名号，模型才认得出这是一个人。
-        const rawName = String(m.sender || '某人');
-        const oddName = rawName.length <= 2 || !/[\p{L}\p{N}]/u.test(rawName);
-        const nameShown = oddName && !m.isSelf ? '「' + rawName + '」' : rawName;
-        const who = m.isSelf
-          ? '你'
-          : (m.userId ? `${nameShown}(${m.userId})` : nameShown);
-        const text = String(m.text ?? '').replace(/\s+/g, ' ').slice(0, 160);
-        const ownerTag = (!m.isSelf && m.isOwner) ? '【主人】' : '';
-        const isNew = Number.isSafeInteger(Number(m.seq)) && freshSeqs.has(Number(m.seq));
-        // 时间戳：她以前分不清「刚发的」和「半小时前的」，会把凉了的梗当新话题接
-        // （2026-10-22 实测 19:47 那轮）。带上 HH:MM 她就能说出「这都半小时前的事了」。
-        let ts = '';
-        const mt = Number(m.time || 0);
-        if (mt > 0) {
-          const d2 = new Date(mt);
-          ts = '[' + String(d2.getHours()).padStart(2, '0') + ':' + String(d2.getMinutes()).padStart(2, '0') + '] ';
-        }
-        // 引用关系：她得知道自己这句是在跟谁说话（群聊交错时最容易搞混）。
-        const rel = m.quoteTargetIsSelf ? ' →回你' : '';
-        parts.push(`${ts}${ownerTag}${who}：${text}${m.hasMedia ? '［带图/表情］' : ''}${rel}${isNew ? '  ← 刚到的' : ''}`);
-      }
-      if (freshSeqs.size) {
-        parts.push('');
-        parts.push('带「← 刚到的」那几条就是你这轮要回的。不带标记的只是背景，别回头去回它们。');
-      }
     }
     const through = snapshot?.readThroughSeq;
     if (Number.isSafeInteger(through)) parts.push(`\n（本次读到的水位 readThroughSeq = ${through}，收尾时填进 markThrough）`);
@@ -8541,7 +8667,7 @@ async function main() {
   }
 
   /** 调一次 DeepSeek chat/completions，返回正文文本。 */
-  async function callLiteApi(lc, systemPrompt, userText, imageParts) {
+  async function callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom = []) {
     if (!lc.apiKey) throw new Error('精简模式缺少 API key（config.socialV2.lite.apiKey 或环境变量 DEEPSEEK_API_KEY）');
     // DeepSeek 的 chat/completions 其实支持 image_url（2026-10-22 实测 deepseek-chat
     // 能正确描述图片内容）。以前「带图就 400」的真因是原图没压、请求体好几 MB 撞了
@@ -8571,26 +8697,23 @@ async function main() {
     // 多张图一起塞进去时她分不清哪张是谁的 —— 2026-10-23 实测：群里同时有「B站视频抽帧图」
     // 和「群友A发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
     // 所以按顺序编号，并点明哪一张是视频。
+    // 只要带了图就说明「哪张是谁发的」，哪怕只有 1 张（2026-10-26）：
+    // 以前只在 >1 张时才编号，于是「1 张图 + 上下文里两条［带图］」时她随便挑一条
+    // 认领，实测把群友B的表情包当成主人发的。顺带把「没附给你的图别猜」也讲明。
     let multiNote = '';
-    if (visionParts.length > 1) {
-      const keyed = (Array.isArray(imageParts) ? imageParts : []).slice(0, 3);
-      // 编号只数「真正的图片」：中间夹着 type:'text' 的占位 part（0 字节），
-      // 用 part 下标会报成「第 3 张」，跟模型看到的第 2 张对不上。
+    if (visionParts.length) {
       const bits = [];
-      let vi = 0;
-      for (const p of keyed) {
-        if (!p || p.type !== 'image') continue;
-        vi += 1;
-        if (p.name === 'video-sheet.jpg') bits.push('第 ' + vi + ' 张＝视频抽帧拼图');
-        else bits.push('第 ' + vi + ' 张＝群友发的图');
+      for (let i = 0; i < visionParts.length; i += 1) {
+        const f = imgFrom[i] || {};
+        const nm = String(f.name || '').trim();
+        bits.push('第 ' + (i + 1) + ' 张＝' + (nm ? nm + ' 发的图' : '群友发的图'));
       }
-      const sheetIdx = bits.findIndex((x) => x.includes('视频抽帧拼图'));
-      multiNote = '\n（本轮附了 ' + visionParts.length + ' 张图，按顺序：';
-      multiNote += bits.join('；') + '。';
-      if (sheetIdx >= 0) {
-        multiNote += '有人问「这个视频讲了什么」时只看「视频抽帧拼图」那张，别把群友发的图当成视频内容。';
+      multiNote = '\n（本轮实际附了 ' + visionParts.length + ' 张图，按顺序：' + bits.join('；') + '。'
+        + '上下文里标［图没附给你］的那些图片**你看不到内容**，别猜、别说它上面有什么字；'
+        + '只有［图已附给你］的那几条你才真看见了图。）';
+      if (Array.isArray(imgFrom) && imgFrom.some((f) => f && f.name === '视频抽帧拼图')) {
+        multiNote += '有人问「这个视频讲了什么」时只看视频抽帧那张，别把群友发的图当成视频内容。';
       }
-      multiNote += '）';
     }
     const userContent = visionParts.length
       ? [{ type: 'text', text: cleanForJson(userText + imgNote + imgHint + multiNote) }, ...visionParts]
@@ -8783,8 +8906,10 @@ async function main() {
           // 实测就把「要回谁」填成了 userId。这里统一解析：
           // 先当 messageId 试，不行再按昵称/QQ 号找那个人最近的一条消息。
           let replyTo;
+          let rawReplyToText = '';
           if (actions.replyTo !== undefined && actions.replyTo !== null && String(actions.replyTo).trim() !== '') {
             const rawReplyTo = String(actions.replyTo).trim();
+            rawReplyToText = rawReplyTo;
             // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（2026-10-22 实测填过
             // 「。(123456789)」，于是 replyTo 解析失败、该引用的没引用）。
             // 所以先把它拆成昵称 / 号码两种写法各试一遍。
@@ -8824,8 +8949,54 @@ async function main() {
             if (target?.userId) atUser = String(target.userId);
             else report.errors.push(`要 @ 的「${rawAt}」在最近消息里找不到对应 QQ 号，已跳过 @`);
           }
+          // 一致性兜底（2026-10-26）：replyTo 指向 A、at 指向 B，而回复里根本没提 B ——
+          // 说明模型把「我引用的那条」和「我要 @ 的人」搞混了（实测：引用群友B的「菜呢」，
+          // 却 @ 了半小时前端白饭的「。」）。宁可不 @，也不 @ 错。
+          if ((replyTo || rawReplyToText) && atUser && kind === 'group') {
+            try {
+              const pool0 = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
+              let rtMsg = replyTo
+                ? pool0.find((m) => String(m.messageId) === String(replyTo))
+                : null;
+              if (!rtMsg && rawReplyToText) {
+                // 引用解析失败（QQ 侧「消息不存在」）时，模型那句 replyTo 仍然表达了
+                // 「我想引谁」——按昵称 / QQ号 / 「昵称(号码)」三种写法回去找那个人，
+                // 否则这条兜底在「引用失败 + @ 错人」同时出现时完全失效（2026-10-26 12:04 实测）。
+                const cands2 = [rawReplyToText];
+                const mm2 = rawReplyToText.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);
+                if (mm2) { if (mm2[2]) cands2.push(mm2[2].trim()); if (mm2[1]) cands2.push(mm2[1].trim()); }
+                rtMsg = pool0.filter((m) => cands2.includes(String(m.userId || '')) || cands2.includes(String(m.sender || ''))).pop();
+              }
+              const rtUid = rtMsg && rtMsg.userId ? String(rtMsg.userId) : '';
+              if (rtUid && rtUid !== String(atUser)) {
+                const nmA = String(nicknameOf(key, atUser) || '');
+                const nmB = String(rtMsg.sender || '');
+                const mentioned = safe.some((t) => (nmA && t.includes(nmA)) || (nmB && t.includes(nmB)));
+                if (!mentioned) {
+                  report.errors.push('@' + atUser + ' 与引用对象(' + rtUid + ')不一致且没提到他，已取消 @');
+                  log('[lite] 撤销可疑 @：回复引用的是 ' + rtUid + '，却 @ 了 ' + atUser);
+                  atUser = null;
+                }
+              }
+            } catch (e) { /* 校验失败不影响发送 */ }
+          }
           const sent = await sendMessagesV2(key, safe, delays, replyTo, atUser);
           recordSentMessagesV2(key, sent);
+          // 2026-10-26：lite 是直接调 onebot 发的，不走 MCP 工具，所以从来没写进
+          // tool-calls.jsonl —— 冷存储里只有群友的话、没有她自己说的（who 分布里一条「我」都没有）。
+          // 这里补一条同格式记录，collectMessages 的第二段就能把她的话也收进去。
+          try {
+            if (Array.isArray(sent) && sent.length) {
+              // sent 里装的是「发出去的那几句正文」（字符串），不是消息对象 ——
+              // 上一版按 x.text 取，全是 undefined，结果一条也没写进去。
+              const real = sent.map((x) => String(x ?? '')).filter(Boolean);
+              if (real.length) {
+                fs.appendFileSync(TOOL_LOG_FILE, JSON.stringify({
+                  type: 'call', key, tool: 'qq_send_message', args: { messages: real }, time: Date.now()
+                }) + '\n');
+              }
+            }
+          } catch { /* 落盘失败不影响发送 */ }
           st.lastAiReplyAt = Date.now();
           st.lastActionAt = Date.now();
           report.sent = sent.length;
@@ -9097,7 +9268,7 @@ async function main() {
   }
 
   const LITE_TURN_FILE = path.join(ROOT, 'state', 'lite-turns.jsonl');
-  const LITE_TURN_KEEP = 300;
+  const LITE_TURN_KEEP = 2000;
 
   /** 记下这一轮她看到的上下文和原始输出（诊断「逻辑不清」只能靠这个现场）。 */
   function dumpLiteTurn(key, reason, userText, rawReply, report) {
@@ -9132,15 +9303,62 @@ async function main() {
     }
   }
 
+  /**
+   * 按需展开一条合并转发 / 聊天记录（2026-10-26）。
+   * 只在模型主动填了 forward 时调用 —— 平时零成本。
+   * 安全边界与 /api/socialV2/forward-message 一致：只能读本会话确实收到过的 id。
+   */
+  async function readForwardForLite(key, rawId) {
+    const id = sanitizeForwardId(rawId);
+    if (!id) return '';
+    try {
+      const st = getSocialV2State(key);
+      const seen = (Array.isArray(st?.recentMessages) ? st.recentMessages : []).some((m) => Array.isArray(m?.forwardIds) && m.forwardIds.includes(id))
+        || (Array.isArray(st?.unread) ? st.unread : []).some((m) => Array.isArray(m?.forwardIds) && m.forwardIds.includes(id))
+        || seenForwardIds.get(key)?.has(id) === true;
+      if (!seen) return '';
+      const data = await bot.raw('get_forward_msg', { id });
+      const fmt = formatForwardResponse(data, { maxMessages: 30, maxCharsPerMessage: 200 });
+      let set = seenForwardIds.get(key);
+      if (!set) { set = new Set(); seenForwardIds.set(key, set); }
+      set.add(id);
+      const lines = [];
+      let imgs = 0;
+      for (const m of fmt.messages || []) {
+        imgs += Array.isArray(m.media) ? m.media.length : 0;
+        for (const fid of m.nestedForwardIds || []) set.add(fid);
+        const who = m.sender || '某人';
+        const when = m.time ? '(' + m.time + ')' : '';
+        lines.push(m.index + '. ' + who + when + '：' + (m.text || '[这里不是文字]'));
+      }
+      if (!lines.length) return '';
+      let block = '（共 ' + fmt.total + ' 条' + (fmt.truncated ? '，只显示前 ' + lines.length + ' 条' : '') + '）\n' + lines.join('\n');
+      if (imgs) block += '\n（里面还有 ' + imgs + ' 张图片/表情，你看不到内容）';
+      return block;
+    } catch (error) {
+      log('[lite] 读合并转发失败 ' + id + ': ' + (error?.message ?? error));
+      return '';
+    }
+  }
+
   /** 精简模式的完整一轮：拼上下文 → 一次 API 调用 → 执行动作。 */
-  async function deliverLiteV2(key, reason, media = [], research = null, sweep = null) {
+  async function deliverLiteV2(key, reason, media = [], research = null, sweep = null, fwd = null) {
     const lc = liteConfig();
     if (!lc.enabled) throw new Error('精简模式未开启');
     const st = getSocialV2State(key);
     const snapshot = buildWakeSnapshotV2(key);
     const systemPrompt = buildLiteSystemPrompt();
-    const userText = buildLiteUserMessage(key, reason, snapshot, research, sweep);
+    const mediaSeqs = new Set(
+      (Array.isArray(media) ? media : [])
+        .map((m) => Number(m && m._seq))
+        .filter((n) => Number.isSafeInteger(n) && n > 0)
+    );
+    const userText = buildLiteUserMessage(key, reason, snapshot, research, sweep, mediaSeqs, fwd);
     const imageParts = Array.isArray(media) && media.length ? await resolveMediaList(media) : [];
+    // 每张图对应的发送人，顺序跟 imageParts 一致（供 callLiteApi 写进提示词）
+    const imgFrom = (Array.isArray(media) ? media : []).map((m) => ({
+      name: m && m._fromName ? String(m._fromName) : ''
+    }));
     // 这一轮要是有视频（QQ 视频消息 或 消息里的 B 站链接），抽一张帧拼图放在最前面。
     // 放在前面是因为 callLiteApi 只取前 3 张图，视频内容才是这轮的重点。
     try {
@@ -9150,13 +9368,14 @@ async function main() {
         const sheet = await videoToSheet(videoSrc.source);
         if (sheet && sheet.buffer) {
           imageParts.unshift({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: 'video-sheet.jpg' });
+          imgFrom.unshift({ name: '视频抽帧拼图' });
         }
       }
     } catch (error) {
       log('[video] 处理失败（不影响这轮回复）: ' + (error?.message ?? error));
     }
     const started = Date.now();
-    const result = await callLiteApi(lc, systemPrompt, userText, imageParts);
+    const result = await callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom);
     const actions = parseLiteActions(result.text);
     // 她自己说「这个我不懂/想不起来」并给了关键词：先翻旧记录（本地、0 成本），
     // 翻到了就带着往事重说一次。只重试一次，第二次无论有没有都不再触发。
@@ -9178,6 +9397,19 @@ async function main() {
         } catch (error) {
           log('[recall] 自查检索失败（不影响这轮）: ' + (error?.message ?? error));
         }
+      }
+    }
+    // 她要展开某条合并转发 → 拉内容、二次调用（2026-10-26）。
+    // 只重试一次：fwd 有值就不再读，避免来回循环。
+    if (!sweep && !fwd) {
+      const wantFwd = String(actions.forward ?? '').trim();
+      if (wantFwd && !/^(null|undefined|none|无|没有|空|false|0)$/i.test(wantFwd)) {
+        const block = await readForwardForLite(key, wantFwd);
+        if (block) {
+          log('[lite] ' + key + ' 她要读合并转发 ' + wantFwd.slice(0, 24) + '，已展开 ' + block.length + ' 字，重说一次');
+          return deliverLiteV2(key, reason, media, research, sweep, { id: wantFwd, block });
+        }
+        log('[lite] ' + key + ' 她要读合并转发 ' + wantFwd.slice(0, 24) + '，读不到（不在可见范围或拉取失败），按普通一轮继续');
       }
     }
     // 先登记「这一轮给模型看过哪些消息」，再算水位。
@@ -12077,7 +12309,14 @@ async function main() {
       if (!m || m.isSelf || !Array.isArray(m.media) || !m.media.length) continue;
       for (const md of m.media) {
         if (!md || typeof md !== 'object') continue;
-        out.push(md);
+        // 挂上来源（2026-10-26）：以前只传图片本体，模型看到「1 张图 + 上下文里两条
+        // ［带图/表情］」根本分不清哪张是谁发的 —— 实测把群友B发的表情包当成主人发的，
+        // 还追问「主人这是冲谁呀」。_ 前缀的字段不会进 API，只给提示词用。
+        out.push(Object.assign({}, md, {
+          _fromName: String(m.sender || ''),
+          _fromUid: m.userId ? String(m.userId) : '',
+          _seq: Number.isSafeInteger(Number(m.seq)) ? Number(m.seq) : 0,
+        }));
         if (out.length >= limit) return out;
       }
     }
@@ -12957,7 +13196,11 @@ async function main() {
     }
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
-    if (plainContent.startsWith('/')) {
+    // 只有桥接自己的这几个命令才拦。别的以 / 开头的一律当聊天 ——
+    // 2026-10-26 实测：她教群友「@某bot /今日老婆」，群友照发，被这句
+    // 「管理命令仅管理员可用」吃掉：她自己在教的东西，被自己的拦截器拦了。
+    const KNOWN_ADMIN_CMD = /^\/(?:reset|new|status|role|人格|silent|quiet|active|speak)(?:\s|$)/;
+    if (plainContent.startsWith('/') && KNOWN_ADMIN_CMD.test(plainContent)) {
       if (!isOwner) {
         await sendToQQ(key, '管理命令仅管理员可用。');
         return;
@@ -13060,7 +13303,12 @@ async function main() {
 
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      // 2026-10-26：原来私聊一律记成「私聊」，冷存储里就分不出是谁说的。
+      // 私聊事件的 sender 一般也有昵称，取不到再退回号码。
+      const privName = event.sender?.card || event.sender?.nickname || '';
+      const sender = kind === 'group'
+        ? (event.sender?.card || event.sender?.nickname || String(event.user_id))
+        : (privName || String(event.user_id) || '私聊');
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
@@ -13104,7 +13352,12 @@ async function main() {
 
     // 仿真群友模式：reserved 走状态机（观望/活跃/试探/退场）
     if (isSocialEnabled()) {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      // 2026-10-26：原来私聊一律记成「私聊」，冷存储里就分不出是谁说的。
+      // 私聊事件的 sender 一般也有昵称，取不到再退回号码。
+      const privName = event.sender?.card || event.sender?.nickname || '';
+      const sender = kind === 'group'
+        ? (event.sender?.card || event.sender?.nickname || String(event.user_id))
+        : (privName || String(event.user_id) || '私聊');
       appendRecentMessage(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, mediaList, messageRef); // AI 始终感知
       const st = socialState(key);
 

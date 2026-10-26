@@ -108,20 +108,26 @@ Windows 上如果 pnpm 报符号链接权限错误，把目录复制到 `~/.dsh/
 | 单元 | 时间 | 干什么 | 漏了会怎样 |
 |---|---|---|---|
 | `qqbridge.service` | 常驻 | 桥接主进程 | —— |
-| `qqbridge-daily-archive.timer` | 每天 04:00 | 归档昨天原文到 `state/memory/group_<群号>/chat-*.jsonl`、轮转 `qq-activity.log`、开新会话 | 冷存储永远是空的，检索永远查不到 |
+| `qqbridge-daily-archive.timer` | 每天 04:00 | 归档昨天原文到 `state/memory/<会话>/chat-*.jsonl`（群聊 `group_<群号>`、私聊 `private_<QQ号>`，各写各的目录）、轮转 `qq-activity.log`、开新会话 | 冷存储永远是空的，检索永远查不到 |
 | `qqbridge-today-sync.timer` | 每 2 分钟 | 把「最近一次 04:00 之后」的原文刷进 `today.jsonl`（幂等覆盖） | 今天发生的事要等明天 04:00 才能查 |
 | `qqbridge-watchdog.timer` | 每 30 分钟 | 查 OneBot 端口 / 服务 / `health.json`，异常发邮件（每小时最多一封） | 掉线没人喊 |
 
 冷存储相关的命令（在安装目录下）：
 
 ```bash
-node archive.mjs <群号>          # 手动归档（加 --switch 才会切新会话）
-node sync-today.mjs              # 手动刷今天的临时库
+node archive.mjs                    # 手动归档所有会话（群聊 + 私聊各写各的目录）
+node archive.mjs <群号>             # 只归档指定的群
+node archive.mjs --switch           # 归档并开新会话（之后要重启 bridge）
+node sync-today.mjs                 # 手动刷今天的临时库
 node recall.mjs 白饭 --context=15   # 按关键词翻原文，每段 15 条带时间
 node recall.mjs github --limit=3    # 最多展开 3 处命中
 ```
 
-**往事检索是怎么进 prompt 的**（`src/lite-recall.mjs`）：默认不注入；只有出现「上次 / 之前 / 还记得 / 老梗」这类词，或**她自己**在输出里写了 `recall: "关键词"`（表示这个梗/名字/旧事她不懂）时才查，命中结果按「▸ 时间范围（几天前）」分段、每条带 `MM-DD HH:MM` 和说话人，最多 3 段、每段 10 条、整块 ≤2400 字。
+**往事检索是怎么进 prompt 的**（`src/lite-recall.mjs`）：群聊默认不注入；只有出现「上次 / 之前 / 还记得 / 老梗」这类词，或**她自己**在输出里写了 `recall: "关键词"`（表示这个梗/名字/旧事她不懂）时才查。命中结果按「▸ 时间范围（几天前）」分段、每条带 `MM-DD HH:MM` 和说话人，最多 3 段、每段 10 条、整块 ≤2400 字。**私聊每轮都查**（本地纯计算、0 次 API，只有你们两个人，滥一点没有副作用）。
+
+**群聊与私聊共享记忆、但出口单向**：两边都能检索到对方的记录，可是在群聊里查到的私聊内容会**逐行**标 `〔私聊〕`、段头加「｜私聊」、整段前加硬警告（不许复述任何细节，被追问就装傻）。私聊视角看不到这条警告。物理上仍然分目录存，永不混写。
+
+**长话题靠「话头追踪」**（`src/lite-thread.mjs`）：每轮先从最近 12 条算出话题签名，再把窗口外跟它沾边的前因捞回来，拼成「开头锚点 + 中间最要紧的 6 条 + 最近 N 条」，中间如实标出略过多少条。想让这个生效，`socialV2.context.recentLimit`（内存保留条数）别低于 100，默认给的是 200。
 
 ---
 

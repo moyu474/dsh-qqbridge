@@ -26,11 +26,11 @@ export const RECALL_TRIGGER_RE = /上次|上回|前阵子|之前|以前|先前|�
 const TRIGGER_WORDS = ['上次', '上回', '之前', '以前', '先前', '记得', '说过', '提过', '聊过', '讲过', '那次', '时候', '当年', '老梗'];
 
 // bigram 里带这些字就不当证据：它们太常见，命中不代表同一件事。
-const STOP_CHARS = new Set(
+export const STOP_CHARS = new Set(
   '的了呢吗啊吧嘛呗哦噢呀哈哇嗯呃是在有没不我你他她它这那就也都还又很太更最个一了下着过要说想会给把被让对为以而且但如所什么怎样今明昨'.split(''),
 );
 
-function bigramsOf(text) {
+export function bigramsOf(text) {
   const out = new Set();
   const s = String(text || '');
   // 英文/数字整词当 token：按两位切会得到 gi/it/th 这种碎片，df 太高全被 8% 阈值滤掉，
@@ -65,7 +65,7 @@ export function queryBigrams(texts) {
  * 读整个冷存储目录（正式归档 + 当天临时库），按时间升序。
  * 记录里的 date 优先；老文件没有 date 字段时才拿文件名里的日期兜底。
  */
-export function loadArchive(dir) {
+export function loadArchive(dir, scope = '') {
   const docs = [];
   if (!dir || !fs.existsSync(dir)) return docs;
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).sort();
@@ -97,7 +97,7 @@ export function loadArchive(dir) {
       const key = `${date}|${hms}|${text}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      docs.push({ date, hms, who, uid: String(r.uid || ''), text });
+      docs.push({ date, hms, who, uid: String(r.uid || ''), text, scope });
     }
   }
   docs.sort((a, b) => (a.date + a.hms).localeCompare(b.date + b.hms));
@@ -194,14 +194,18 @@ export function renderContext(docs, centers, { span = 10, perLine = 110, maxChar
       // who 里可能是昵称（新数据），带上 QQ 号跟「群里最近的消息」保持同一种写法；
       // 老数据只有「群友」，那就照实写「群友」
       const label = d.who === '我' ? '你' : (d.uid ? `${d.who || '群友'}(${d.uid})` : (d.who || '群友'));
-      const line = `${mark}${fmtTime(d)} ${label}：${clip(d.text, perLine)}`;
+      // 2026-10-26：标记必须打在**每一行**上。之前只按段中心判断，
+      // 结果 span 把私聊的行拉进一个「群聊」段里时那一行就没有标记 —— 那是泄露口子。
+      const rowTag = d.scope === 'private' ? '〔私聊〕' : '';
+      const line = `${mark}${rowTag}${fmtTime(d)} ${label}：${clip(d.text, perLine)}`;
       if (maxChars && total + segLen + line.length + 40 > maxChars) break;
       seg.push(line);
       segLen += line.length + 1;
     }
     if (!seg.length) continue;
     const span = `${fmtTime(docs[p.from])} ~ ${fmtTime(docs[p.to])}`;
-    const head = `▸ ${span}（${agoText(docs[p.center], now)}）`;
+    const scopeTag = docs[p.center] && docs[p.center].scope === 'private' ? '｜私聊' : '';
+    const head = `▸ ${span}（${agoText(docs[p.center], now)}）${scopeTag}`;
     const block = [head, ...seg].join('\n');
     if (maxChars && total + block.length + 20 > maxChars) break;
     total += block.length + 1;
@@ -217,9 +221,19 @@ export function renderContext(docs, centers, { span = 10, perLine = 110, maxChar
  * 主入口：给一批本轮消息，返回可以直接拼进 prompt 的一段文字。
  * @returns {{ block: string, hits: Array<{time:string,score:number,who:string,text:string}> }}
  */
-export function recallColdStorage({ dir, texts, limit = 3, span = 10, maxChars = 2400, perLine = 110 } = {}) {
-  const docs = loadArchive(dir);
+export function recallColdStorage({ dir, dirs, texts, viewer = '', limit = 3, span = 10, maxChars = 2400, perLine = 110 } = {}) {
+  // 2026-10-26：支持一次查多个会话目录（群聊 + 私聊共享记忆）。
+  // dirs 的元素可以是字符串，也可以是 { dir, scope }。
+  let list2 = Array.isArray(dirs) && dirs.length ? dirs : (dir ? [dir] : []);
+  const docs = [];
+  for (const item of list2) {
+    const d = typeof item === 'string' ? item : (item && item.dir);
+    const scope = typeof item === 'string' ? '' : String((item && item.scope) || '');
+    if (!d) continue;
+    for (const x of loadArchive(d, scope)) docs.push(x);
+  }
   if (!docs.length) return { block: '', hits: [] };
+  docs.sort((a, b) => (a.date + a.hms).localeCompare(b.date + b.hms));
   // 只拿「问往事的那几句话」当查询。全塞进去会被上下文里的常用词带偏 ——
   // 实测把最近 40 条一起喂进去，问「白饭」捞回来的全是「服务器」。
   const list = Array.isArray(texts) ? texts.map((t) => String(t || '')) : [];
@@ -254,10 +268,22 @@ export function recallColdStorage({ dir, texts, limit = 3, span = 10, maxChars =
   if (!cands.length) return { block: '', hits: [] };
 
   cands.sort((a, b) => b.score - a.score || b.i - a.i);
-  return renderContext(docs, cands.slice(0, limit), {
-    span,
-    perLine,
-    maxChars,
-    header: '【以前群里聊过】（下面都是过去的对话，每段开头的 ▸ 是时间范围和距今多久；别把不同时间的事混成一件，也别当成刚发生的。说话人后面括号里是 QQ 号，写「群友」的是早期记录没存下具体是谁的其他人）'
-  });
+  const picked = cands.slice(0, limit);
+  // 只看被选中的段落里有没有私聊行（按行判断，别漏掉 span 带进来的）
+  const hasPrivate = picked.some((c) => {
+    for (let j = Math.max(0, c.i - 5); j <= Math.min(docs.length - 1, c.i + 5); j += 1) {
+      if (docs[j] && docs[j].scope === 'private') return true;
+    }
+    return false;
+  }) && viewer !== 'private';
+  const header = hasPrivate
+    ? '【以前聊过】（下面都是过去的对话，每段开头的 ▸ 是时间范围和距今多久。\n'
+      + '⚠️ 标了「｜私聊」的那几段，是你和主人**私下**说的；你现在在群里。\n'
+      + '你可以记得、可以因此更懂他在说什么，但**绝对不能把私聊内容说出来**：\n'
+      + '不能提「你上次私聊跟我说…」，不能复述里面的任何细节、人名、数字。\n'
+      + '被别人追问就说「没什么」，宁可装傻也不能漏。）'
+    : (viewer === 'private'
+        ? '【以前聊过】（下面都是过去的对话，每段开头的 ▸ 是时间范围和距今多久；私聊和群里的记录都在，标〔私聊〕的是你俩私下说的。别把不同时间的事混成一件，也别当成刚发生的）'
+        : '【以前群里聊过】（下面都是过去的对话，每段开头的 ▸ 是时间范围和距今多久；别把不同时间的事混成一件，也别当成刚发生的。说话人后面括号里是 QQ 号，写「群友」的是早期记录没存下具体是谁的其他人）');
+  return renderContext(docs, picked, { span, perLine, maxChars, header });
 }
