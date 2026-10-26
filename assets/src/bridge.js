@@ -8220,7 +8220,15 @@ async function main() {
     const w = finish.wake && typeof finish.wake === 'object' && !Array.isArray(finish.wake) ? finish.wake : null;
     if (w) {
       const next = { ...st.wakeConfig, triggers: { ...(st.wakeConfig?.triggers || {}) } };
-      if (w.mode === 'active') {
+      if (w.mode === 'active' && String(key).startsWith('private:')) {
+        // 私聊没有「群里每条都看」这回事 —— 私聊消息本来就每条都唤醒，
+        // active 只会把 anyMessage 打开，多此一举还容易连环醒（2026-10-26 实测：
+        // 她设了 active 之后主人连发 3 条，她回了 3 轮 7 句，「趴着等」说了 4 遍）。
+        next.mode = 'diving';
+        next.infinite = false;
+        next.sleepUntil = new Date(Date.now() + 45 * 60000).toISOString();
+        next.triggers.anyMessage = false;
+      } else if (w.mode === 'active') {
         next.mode = 'active';
         next.infinite = true;
         next.sleepUntil = null;
@@ -8305,6 +8313,7 @@ async function main() {
   "replyTo": "要回复谁：填对方昵称或 QQ 号（桥接会自动找到那条消息），也可以填 messageId；仅当你在回更早的某条、或连发时指代不同人",
   "at": "要 @ 谁：填消息里括号中的 QQ 号（照抄，别自己编）",
   "forward": "要展开某条「合并转发 / 聊天记录」时填它的 id（上下文里 [转发消息 id=xxx] 的那串）。**这两种情况该填**：群友让你看/问你里面写了什么；或者你自己觉得不看就接不上话。不填就不读，不花额外钱，所以别客气。",
+  "poke": "想戳一下某个人的时候填他的 QQ 号（上下文里出现过的人）。**拍一拍是「不说话也能碰你一下」的动作**：他没回你、你想提醒他、撒娇要 Attention、他说的话让你想拍他。十分钟最多一次，别当成每条消息的附赠动作；不想拍就不填。",
   "sticker": "要单独发的一张表情包标签",
   "liking": 0,
   "remember": { "who": "对方的QQ号或昵称", "note": "一句话印象，20字以内" },
@@ -8324,8 +8333,12 @@ async function main() {
 - **replyTo 和 at 必须是同一件事**：你引用了谁的话，at 就该是他；反过来也一样。引 A 说的「菜呢」却 @ B，群里看着就是乱的。真要在一句里点别人，就把「@昵称 内容」写进 reply 里，别改 at 字段。
 - **一轮里要 @ 两个人怎么办**：at 字段只能填一个。另一个人的 @ 直接写进那条 reply 里，格式「@昵称 内容」或「@QQ号 内容」，桥接会自动解析成真 @。例：第一条回 A 的问题，第三条想接 B 发的图，就写成「@B 这图…」这样。
 - sticker：想发表情就填一个标签，会单独成一条发出去，跟你说话不冲突，可以同一轮又要说话又发表情。常用场景：无语、得意、委屈、想撒娇、被怼到了。不必每轮都发，五六轮一张就差不多；标签只能从下面这张表里挑，挑不到就不填。
+- **poke 什么时候用**：拍一拍是「不说话也能碰你一下」的动作 —— 他没回你、你想提醒他、撒娇要 Attention、他说的东西让你想拍他。填**他消息里括号中的 QQ 号**（照抄，别编）；拍完不用在 reply 里解释。**十分钟最多一次**，别每条都附一个拍，那是骚扰不是撒娇。
 - **换个花样**：同一个词别连着好几轮都用。「就这？」「配你个头」「你配吗」这种用一次就够，第二轮还用它就像卡带了。
 - **同一张图别反复点评**：上一轮已经说过「这熊猫好憨」，这一轮就换个说法或者直接不接；连着两轮用几乎一样的句子描述同一张图，看着像卡住了（2026-10-26 实测，同一张熊猫图说了两遍「表情好憨」）。
+- **重复别人的话，只在「接梗 / 反驳 / 呼应」时才有意义**：他损你一句「就这？」，你回「就这？」是接住了；他说「嗯，知道了」，你也「嗯，知道了」就是没话找话。判断标准是**重复完有没有带出新的意思**——没有就别发。
+- **同一个意思说一遍就够**：你已经说过「那我先趴一会」，下一轮就别再说「好，我趴着等」「好，那我先趴着」。换个说法还是同一个意思，连着说三四遍像卡住了；要接就接**新的**内容（问几天、问几点、问到时候怎么叫）。
+- **「主人——」这种拖长音的称呼，十分钟最多叫一次**。每轮开头都叫一遍，像复读机。
 - liking 是给「当前跟你说话的那个人」的好感变化：0 没什么感觉（默认）、1 聊得挺舒服、2 很喜欢（被夸、被护着、喂你吃的）。只增不减，别给负分。
 - remember 可选：只有确实了解到某人**新的、以后还用得着的**情况（他是谁、爱怎么对你、有什么习惯）才填一条；闲聊内容不要记，没有就不填。
 {{VOICE_RULES}}
@@ -8409,7 +8422,9 @@ async function main() {
     let list = [...extraUnread, ...recent];
     // 窗口外的前因按时间顺序插到最前面，中间用省略标记隔开
     if (thread.active && Array.isArray(thread.rows) && thread.rows.length) {
-      const head = thread.rows.map((r) => (r.type === 'gap' ? { __gap: r.n } : r.m));
+      // 包一层带 __old 标记：**不要直接改 r.m**，那是 recentMessages 里的对象引用，
+      // 改了会把「这是旧消息」永久烙在真实消息上。
+      const head = thread.rows.map((r) => (r.type === 'gap' ? { __gap: r.n } : { ...r.m, __old: true }));
       list = [...head, ...list];
     }
     if (list.length) {
@@ -8417,7 +8432,7 @@ async function main() {
         ? '【你和 TA 的私聊】（旧 → 新；括号里是 QQ 号，「你」是你自己）'
         : '【群里最近的消息】（旧 → 新；括号里是 QQ 号，「你」是你自己）';
       parts.push(thread.active
-        ? headLine.slice(0, -1) + `。**这个话题从 ${thread.startTime} 起已经聊了 ${thread.count} 条**，开头和最要紧的几句我也按顺序给你了，中间用「……略」标出）`
+        ? headLine.slice(0, -1) + `。**这个话题从 ${thread.startTime} 起已经聊了 ${thread.count} 条**。开头标「〔早先〕」的是几小时前的旧消息，只帮你回忆起这个话题是怎么起头的，**不要回头去回它们**；「……略」是中间跳过的部分）`
         : headLine);
       for (const m of list) {
         // 中间被省略的那一段：明说省略多少条，免得她以为中间没人说话
@@ -8456,7 +8471,10 @@ async function main() {
           const mine = attachedSeqs && Number.isSafeInteger(Number(m.seq)) && attachedSeqs.has(Number(m.seq));
           imgTag = mine ? '［图已附给你］' : '［图没附给你，你看不到这条的图］';
         }
-        parts.push(`${ts}${ownerTag}${who}：${text}${imgTag}${rel}${isNew ? '  ← 刚到的' : ''}`);
+        // 捞回来的旧消息要和「现在正聊的」区分开（2026-10-26）：实测她会把两小时前的
+        // 「我给你兜底」当成待回应的事，隔一会儿又问一遍「那个兜底还算不算数」。
+        const oldTag = m && m.__old ? '〔早先〕' : '';
+        parts.push(`${oldTag}${ts}${ownerTag}${who}：${text}${imgTag}${rel}${isNew ? '  ← 刚到的' : ''}`);
       }
       if (freshSeqs.size) {
         parts.push('');
@@ -8583,7 +8601,7 @@ async function main() {
     // 主动机会：以前 proactiveCheck 一天都没触发过一次（idle 要 15 分钟 + 概率 0.3 + 各种折扣），
     // 所以她从来不会自己冒一句。现在告诉模型「这是可以主动开口的时机」。
     if (reason === 'proactiveCheck' || reason === 'timeout') {
-      parts.push('【现在是你可以自己开口的时候】群里安静了一会儿。有想说的就冒一句（比如想起来刚才聊的、吐槽一件小事、问一句），没想说的就省略 reply 继续潜水。');
+      parts.push('【现在是你可以自己开口的时候】群里安静了一会儿。有想说的就冒一句（**说点新的**：吐槽一件小事、问一句、分享个念头），**别把刚才已经聊过、已经答过的事再问一遍** —— 那不叫想聊，叫卡带。没想说的就省略 reply 继续潜水。');
       parts.push('');
     }
     if (research && research.text) {
@@ -8891,7 +8909,9 @@ async function main() {
       .filter(Boolean);
     // 以前这里直接 slice(0,3) 静默丢弃：模型生成了 4 条、群里只出现 3 条，
     // 而 prompt 里还写着「最多 5 条」，两边不一致（2026-10-23 主人发现少了一句）。
-    const BURST_CAP = 4;
+    // 一轮最多 3 条（原 4）。实测 16:16 那轮：主人连发 3 条短句，她每条都回 2-3 句，
+    // 变成「主人说 1 句、她说 2.7 句」，看着像她在自言自语（2026-10-26）。
+    const BURST_CAP = 3;
     if (msgs.length > BURST_CAP) {
       log('[lite] 生成了 ' + msgs.length + ' 条，只发前 ' + BURST_CAP + ' 条（丢弃：' + msgs.slice(BURST_CAP).map((x) => String(x).slice(0, 20)).join(' / ') + '）');
       msgs.length = BURST_CAP;
@@ -9021,6 +9041,65 @@ async function main() {
         report.errors.push(`表情失败：${error?.message ?? error}`);
       }
     }
+    // ②' 拍一拍（2026-10-26）：和 sticker 一样是「说话之外的附带动作」。
+    // lite 没有工具循环，所以跟 forward 一个思路 —— 模型只填要拍谁，桥接解析 + 执行。
+    if (actions.poke !== undefined && actions.poke !== null && String(actions.poke).trim() !== '') {
+      try {
+        const rawPoke = String(actions.poke).trim();
+        if (!/^(null|undefined|none|无|不拍|false|0)$/i.test(rawPoke)) {
+          // ① 目标只认「最近说过话的人」，且不含自己发的消息 —— 天然排除拍自己
+          const pool = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
+          let targetUid = '';
+          const cands = [rawPoke];
+          const mm2 = rawPoke.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);
+          if (mm2) {
+            if (mm2[2]) cands.push(mm2[2].trim());
+            if (mm2[1]) cands.push(mm2[1].trim());
+          }
+          if (/^[1-9]\d{4,11}$/.test(rawPoke)) {
+            targetUid = rawPoke;
+          } else {
+            const hit = pool.filter((m) => cands.includes(String(m.userId || ''))
+              || cands.includes(String(m.sender || ''))).pop();
+            if (hit && hit.userId) targetUid = String(hit.userId);
+          }
+          // ② 频率：十分钟最多一次（拍一拍比说话克制得多，多了就是骚扰）
+          const POKE_MIN_GAP_MS = 10 * 60 * 1000;
+          if (!targetUid) {
+            report.errors.push('要拍的「' + rawPoke + '」在最近消息里找不到对应 QQ 号，已跳过');
+          } else if (kind === 'private' && String(targetUid) !== String(id)) {
+            // 私聊的 send_poke 只能拍当前会话对象，拍第三个人是不存在的操作
+            report.errors.push('私聊只能拍对方，已跳过（要求拍 ' + targetUid + '）');
+          } else if (st.lastPokeAt && Date.now() - Number(st.lastPokeAt) < POKE_MIN_GAP_MS) {
+            report.errors.push('刚拍过，十分钟内不再拍');
+          } else {
+            if (kind === 'group') {
+              const memberError = await assertGroupMember(id, targetUid);
+              if (memberError) throw new Error(memberError);
+              await bot.raw('group_poke', { group_id: id, user_id: Number(targetUid) });
+            } else {
+              await bot.raw('send_poke', { user_id: id });
+            }
+            st.lastPokeAt = Date.now();
+            // 记进上下文，下一轮她自己知道「我刚才拍了谁」
+            const pokeText = kind === 'group'
+              ? '[拍一拍] 我拍了拍 ' + String(nicknameOf(key, targetUid) || targetUid)
+              : '[拍一拍] 我拍了拍你';
+            st.recentMessages.push({
+              messageId: null, sender: '我', text: pokeText, plain: pokeText,
+              isSelf: true, time: Date.now(), media: [], hasMedia: false,
+            });
+            const rl2 = Number(cfg.socialV2?.context?.recentLimit) || 100;
+            if (st.recentMessages.length > rl2) st.recentMessages.splice(0, st.recentMessages.length - rl2);
+            report.poke = targetUid;
+            log('[lite] ' + key + ' 拍了拍 ' + targetUid);
+          }
+        }
+      } catch (error) {
+        report.errors.push('拍一拍失败：' + (error?.message ?? error));
+      }
+    }
+
     // ③ 收尾：推进已读水位 + 设定下一次唤醒（复用 B 的 finish 逻辑）
     // 水位**不让模型填**：它看不到真实的 seq，填了多半是错的（实测 unread 会卡住 7 条）。
     // lite 是一次性生成，本次快照里塞给它的消息它必然全看过 —— 直接用快照算出来的水位。
