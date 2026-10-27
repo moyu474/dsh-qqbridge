@@ -9,7 +9,7 @@
 #
 # 为什么必须重启：bridge 只在启动时把 config.json 读进内存，改文件不会热生效。
 set -uo pipefail
-cd /root/qq-bridge || exit 1
+cd "$(dirname "$0")" || exit 1
 
 usage() {
   cat <<'EOF'
@@ -29,7 +29,7 @@ import json, sys, time, shutil, os
 
 args = sys.argv[1:]
 action = args[0].lower()
-CFG = '/root/qq-bridge/config.json'
+CFG = os.path.join(os.getcwd(), 'config.json')
 cfg = json.load(open(CFG, encoding='utf-8'))
 allow = cfg.setdefault('allow', {})
 allow.setdefault('groups', [])
@@ -84,4 +84,4 @@ echo '--- 重启 qqbridge 让配置生效 ---'
 systemctl restart qqbridge
 sleep 8
 echo "qqbridge: $(systemctl is-active qqbridge)"
-tail -2 /root/qq-bridge/bridge.log
+tail -2 ./bridge.log

@@ -13,9 +13,9 @@
 #
 # 预算日以 04:00 为分界（跟每日归档/开新会话同一个点），所以「今天」= 最近一个 04:00 之后到现在。
 set -uo pipefail
-cd /root/qq-bridge || exit 1
+cd "$(dirname "$0")" || exit 1
 
-CFG=/root/qq-bridge/config.json
+CFG=./config.json
 
 calc_keys() {
 python3 - "$CFG" <<'PY'

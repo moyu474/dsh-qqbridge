@@ -11,9 +11,10 @@
 // 只补 who === '群友' 且没有 uid 的行；跑前每个文件备份成 .bak-backfill。
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { knownSenders, senderKey } from './src/chat-source.mjs';
 
-const ROOT = '/root/qq-bridge';
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIR = path.join(ROOT, 'state/memory/group___GROUP_ID__');
 
 const known = knownSenders(ROOT);

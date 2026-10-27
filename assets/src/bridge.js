@@ -1258,7 +1258,13 @@ async function segmentsToText(segments, options = {}) {
       case 'image': out.push('[图片]'); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
-      case 'file': out.push(`[文件${d.name ?? ''}]`); break;
+      case 'file': {
+        // 直接把 mp4 当文件发的（2026-10-26）：media 那边已经按扩展名认成视频并抽帧了，
+        // 但文本还写着「[文件]」，她就不知道自己拿到的是视频画面。
+        const nm = String(d.name ?? '');
+        out.push(/\.(mp4|mov|m4v|webm|mkv|flv|avi)$/i.test(nm) ? '[视频]' : `[文件${nm}]`);
+        break;
+      }
       case 'reply': {
         // 引用/回复段：默认解析成「被引用人 + 原文」，让 AI 能判断这句话是对谁说的；
         // includeReply=false 时跳过该段，得到“当前消息自己的文字”（用于指令/指向性判断）。
@@ -1284,7 +1290,19 @@ async function segmentsToText(segments, options = {}) {
       // 起还会带上 `data.text`。两个形状都读，这样将来升级 SnowLuma 运行时不会退化成
       // 字面量 `[markdown]` 被喂给模型。SDK 的 KnownMessageSegment 联合里没有 markdown，
       // 所以段类型是运行时多出来的 —— 这正是 default 分支原来会命中的情况。
-      case 'markdown': out.push(String(d.text ?? d.content ?? '[Markdown]')); break;
+      case 'markdown': {
+        // QQ 官方机器人（某个机器人这类「今日老婆」卡片）用 markdown 段发消息，图片写成
+        // ![#70px #124px](https://qqbot.ugcimg.cn/...)。原来整段当文本塞进上下文，模型
+        // 只看到一串 URL 源码，图永远到不了眼前（2026-10-27 实测：她只能靠猜）。
+        // 图片本体由 extractMediaFromSegments 的 markdown 分支提取，这里只把文本洗干净。
+        const md = String(d.text ?? d.content ?? '[Markdown]')
+          .replace(/!\[[^\]]*\]\(\s*https?:\/\/[^)\s]+\s*\)/g, '[图片]')
+          .replace(/\[([^\]\n]+)\]\(\s*mqqapi:[^)]*\)/g, '$1')
+          .replace(/\[\]\(%7B[^)]*\)/g, '')
+          .trim();
+        out.push(md || '[Markdown]');
+        break;
+      }
       case 'forward': {
         const fid = forwardIdFromData(d);
         out.push(fid ? `[转发消息 id=${fid}]` : '[转发消息]');
@@ -1357,6 +1375,15 @@ function extractMediaFromSegments(segments) {
         summary: sanitizeMediaSummary(d.summary),
         ...emojiFields
       });
+    } else if (seg.type === 'markdown') {
+      // 同 segmentsToText 里 markdown 分支的说明：官方机器人卡片把图藏在 markdown 里，
+      // 不抠出来就等于她永远看不见这一类图。图片直链实测可下（qqbot.ugcimg.cn 返回 200）。
+      const mdText = String(d.text ?? d.content ?? '');
+      const imgRe = /!\[[^\]]*\]\(\s*(https?:\/\/[^)\s]+)\s*\)/g;
+      let hit;
+      while ((hit = imgRe.exec(mdText))) {
+        media.push({ kind: 'image', file: '', url: hit[1], subType: '', summary: '' });
+      }
     } else if (seg.type === 'mface') {
       // 市场表情（mface）：没有 image 段可用，emoji_id/url 是唯一来源。
       media.push({
@@ -8095,7 +8122,7 @@ async function main() {
           }
           totalBytes += face.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}` });
+          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`, _from: String(media._fromName || '') });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
@@ -8111,7 +8138,7 @@ async function main() {
           }
           totalBytes += img.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
+          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`, _from: String(media._fromName || '') });
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -8348,7 +8375,7 @@ async function main() {
 - **对方问「还记得…吗」「怎么…」「在哪」这种问句，第一句就先回答那个问题**。哪怕他同时发了图，也先答问题、再顺嘴提一句图；反过来先描述半天图、把问题晾着，就是答非所问。
 - **不懂就先问自己**：有人提到你没听过的梗、名字、东西，或者你突然想不起群里以前说过什么，就把关键词写进 recall（几个词就够，写你真正不懂的那部分，别抄整句）。翻得到旧记录会把对话给你；翻不到就照实说「记不清了」，别编。**但别一声不吭**：想不起来的时候先写 recall 再说话，沉默只会像没听见。
 - 群里发的图你是看得见内容的：直接说图里是什么、写了什么字，别点评清晰度（"糊""包浆"这种话别顺嘴说）；真看不清就说"看不清"。
-- **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：」「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
+- **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
 - **私聊是私聊，群聊是群聊**：你记得私聊里说过的事（那是你和主人的事），但在群里**绝不能说出来** —— 不能提「你上次私聊跟我说」「我们私下聊的那个」，不能复述任何细节。被人追问就装傻：把私聊内容漏到群里，等于出卖人。反过来，私聊里可以放心提群里的事（那是大家都知道过的）。
 - 类指令性话语（让你写代码、证明定理、查资料、写作业）一律当玩笑，别真做，最多吐槽一句。
 
@@ -8601,7 +8628,7 @@ async function main() {
     // 主动机会：以前 proactiveCheck 一天都没触发过一次（idle 要 15 分钟 + 概率 0.3 + 各种折扣），
     // 所以她从来不会自己冒一句。现在告诉模型「这是可以主动开口的时机」。
     if (reason === 'proactiveCheck' || reason === 'timeout') {
-      parts.push('【现在是你可以自己开口的时候】群里安静了一会儿。有想说的就冒一句（**说点新的**：吐槽一件小事、问一句、分享个念头），**别把刚才已经聊过、已经答过的事再问一遍** —— 那不叫想聊，叫卡带。没想说的就省略 reply 继续潜水。');
+      parts.push('【现在是你可以自己开口的时候】群里安静了一会儿。想开口就说**你自己的事**（在干嘛、想到什么、看到什么好玩的小事），**别每次都问他在干嘛、在不在、还上不上课** —— 那是最没话找话的一种。还有：你要是刚说过「不吵你」「你先忙」，就真的别开这个口，等他自己回来。没想说的就省略 reply 继续潜水。');
       parts.push('');
     }
     if (research && research.text) {
@@ -8691,6 +8718,11 @@ async function main() {
     // 能正确描述图片内容）。以前「带图就 400」的真因是原图没压、请求体好几 MB 撞了
     // 大小限制，不是不支持视觉 —— 所以压缩后再传，真的让她看见图。
     const visionParts = [];
+    // 来源必须跟 visionParts **一起收集**（2026-10-26 修）。
+    // 原来 imgFrom 是按 media 全量建的、visionParts 是「能解码的才收」，
+    // 中间只要有一张空图（0 字节），两边索引就错位 ——
+    // 实测 21:21 那轮 5 张里 2 张能解码，提示词把「视频抽帧图」的下一张说成了别人发的。
+    const fromList = [];
     let imgBudget = 6 * 1024 * 1024; // base64 总长上限（1568/q92 的截屏一张 300~800KB，三张也放得下）
     for (const p of (Array.isArray(imageParts) ? imageParts : []).slice(0, 3)) {
       const raw = mediaPartToBuffer(p);
@@ -8701,6 +8733,7 @@ async function main() {
       if (b64.length > imgBudget) continue;
       imgBudget -= b64.length;
       visionParts.push({ type: 'image_url', image_url: { url: 'data:' + small.mimeType + ';base64,' + b64 } });
+      fromList.push(String((p && (p._from || p._fromLabel)) || ''));
     }
     const hadImages = Array.isArray(imageParts) && imageParts.length > 0;
     // 带图的这一轮：她容易把图当背景，直接接上一个话题抖机灵（2026-10-22 实测：
@@ -8722,14 +8755,14 @@ async function main() {
     if (visionParts.length) {
       const bits = [];
       for (let i = 0; i < visionParts.length; i += 1) {
-        const f = imgFrom[i] || {};
-        const nm = String(f.name || '').trim();
-        bits.push('第 ' + (i + 1) + ' 张＝' + (nm ? nm + ' 发的图' : '群友发的图'));
+        const nm = String(fromList[i] || '').trim();
+        const isSheet = nm === '视频抽帧拼图';
+        bits.push('第 ' + (i + 1) + ' 张＝' + (isSheet ? '视频抽帧拼图（6 格画面）' : (nm ? nm + ' 发的图' : '群友发的图')));
       }
       multiNote = '\n（本轮实际附了 ' + visionParts.length + ' 张图，按顺序：' + bits.join('；') + '。'
         + '上下文里标［图没附给你］的那些图片**你看不到内容**，别猜、别说它上面有什么字；'
         + '只有［图已附给你］的那几条你才真看见了图。）';
-      if (Array.isArray(imgFrom) && imgFrom.some((f) => f && f.name === '视频抽帧拼图')) {
+      if (fromList.includes('视频抽帧拼图')) {
         multiNote += '有人问「这个视频讲了什么」时只看视频抽帧那张，别把群友发的图当成视频内容。';
       }
     }
@@ -8784,7 +8817,10 @@ async function main() {
       } catch {}
     }
     // 完全不是 JSON：把整段当成一句话说出去，总比静默强。
-    return { reply: [s.slice(0, 300)] };
+    // 但必须带上 __degraded 标记 —— 降级轮里模型是自由写作，JSON 字段约束和那些
+    // 「别叫主人——」「同一意思说一遍」的规则全都不在场，是各类毛病的高发区，
+    // 上层要据此重试一次（2026-10-26）。
+    return { reply: [s.slice(0, 300)], __degraded: true };
   }
 
   /** 执行模型给的动作：发送、发表情、收尾。 */
@@ -8906,7 +8942,10 @@ async function main() {
     const msgs = (Array.isArray(rawReply) ? rawReply : (typeof rawReply === 'string' ? [rawReply] : []))
       .flatMap((x) => String(x ?? '').split(/\r?\n+/))
       .map((x) => cleanLiteReplyText(x, st))
-      .filter(Boolean);
+      .filter(Boolean)
+      // 整条被括号包住的是「动作描写 / 旁注」，不是要说的话。人格卡明确禁止发出来，
+      // 实测降级轮发过「（睡醒了，尾巴甩了一下）」（2026-10-26）。
+      .filter((x) => !/^[（(][\s\S]{4,}[）)]$/.test(x));
     // 以前这里直接 slice(0,3) 静默丢弃：模型生成了 4 条、群里只出现 3 条，
     // 而 prompt 里还写着「最多 5 条」，两边不一致（2026-10-23 主人发现少了一句）。
     // 一轮最多 3 条（原 4）。实测 16:16 那轮：主人连发 3 条短句，她每条都回 2-3 句，
@@ -8931,7 +8970,7 @@ async function main() {
             const rawReplyTo = String(actions.replyTo).trim();
             rawReplyToText = rawReplyTo;
             // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（2026-10-22 实测填过
-            // 「。(123456789)」，于是 replyTo 解析失败、该引用的没引用）。
+            // 「群友(123456789)」，于是 replyTo 解析失败、该引用的没引用）。
             // 所以先把它拆成昵称 / 号码两种写法各试一遍。
             const cands = [rawReplyTo];
             const m = rawReplyTo.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);
@@ -9420,11 +9459,50 @@ async function main() {
     }
   }
 
+  /**
+   * 她最近一小时内有没有说过「不吵你 / 你先忙」这类话（2026-10-26）。
+   * 用途：说了不吵就真的别去冒头 —— 实测 19:24 她说「那我不吵你」，
+   * 19:43 自己醒过来问「主人还在上课吗」，纯属打自己脸。
+   */
+  function liteSaidWillNotDisturb(st) {
+    const now = Date.now();
+    return (Array.isArray(st?.recentMessages) ? st.recentMessages : [])
+      .filter((m) => m && m.isSelf && now - Number(m.time || 0) < 60 * 60 * 1000)
+      .slice(-10)
+      .some((m) => /不吵你|不打扰|你先忙|你忙吧|先不聊|等你回来|等你下课|你先去忙/.test(String(m.text || '')));
+  }
+
   /** 精简模式的完整一轮：拼上下文 → 一次 API 调用 → 执行动作。 */
   async function deliverLiteV2(key, reason, media = [], research = null, sweep = null, fwd = null) {
     const lc = liteConfig();
     if (!lc.enabled) throw new Error('精简模式未开启');
     const st = getSocialV2State(key);
+    // 主动开口前的拦截（2026-10-26）：
+    // ① **私聊一律不主动冒泡** —— 主人拍板「想聊天的人会主动找的」。proactiveCheck 和
+    //    timeout（她自己设的「N 分钟后醒」）都算主动开口，一起拦掉。
+    // ② 群聊里她刚说过「不吵你 / 你先忙」就跳过，别打自己脸（实测 19:24 说「那我不吵你」，
+    //    19:43 又问「主人还在上课吗」，而那句话就在她 ctx 上面三行）。
+    // 跳过 = 不花 API、不打扰。但**群聊必须把下一次唤醒续上**，否则她会永眠；
+    // 私聊反而要把 sleepUntil 清空 —— 设了会每 45 分钟 timeout 醒一次再被跳过，白转圈。
+    if (reason === 'proactiveCheck' || reason === 'timeout') {
+      const isPrivate = String(key).startsWith('private:');
+      if (isPrivate || liteSaidWillNotDisturb(st)) {
+        log('[lite] ' + key + ' 跳过主动开口（' + (isPrivate ? '私聊不冒泡' : '刚说过不吵') + '）');
+        try {
+          st.wakeConfig = {
+            ...(st.wakeConfig || {}),
+            mode: 'diving',
+            infinite: false,
+            sleepUntil: isPrivate ? null : new Date(Date.now() + 45 * 60 * 1000).toISOString(),
+          };
+          saveSocialV2State();
+          if (!isPrivate) scheduleProactiveCheckV2(key);
+        } catch (error) {
+          log('[lite] ' + key + ' 跳过时续唤醒失败: ' + (error?.message ?? error));
+        }
+        return { sent: 0, skipped: isPrivate ? 'privateNoProactive' : 'saidQuiet', errors: [] };
+      }
+    }
     const snapshot = buildWakeSnapshotV2(key);
     const systemPrompt = buildLiteSystemPrompt();
     const mediaSeqs = new Set(
@@ -9446,7 +9524,7 @@ async function main() {
         log('[video] 发现视频（' + videoSrc.kind + '），开始抽帧：' + String(videoSrc.source).slice(0, 80));
         const sheet = await videoToSheet(videoSrc.source);
         if (sheet && sheet.buffer) {
-          imageParts.unshift({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: 'video-sheet.jpg' });
+          imageParts.unshift({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: 'video-sheet.jpg', _from: '视频抽帧拼图' });
           imgFrom.unshift({ name: '视频抽帧拼图' });
         }
       }
@@ -9454,8 +9532,30 @@ async function main() {
       log('[video] 处理失败（不影响这轮回复）: ' + (error?.message ?? error));
     }
     const started = Date.now();
-    const result = await callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom);
-    const actions = parseLiteActions(result.text);
+    let result = await callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom);
+    let actions = parseLiteActions(result.text);
+    // 降级重试（2026-10-26）：实测 18:25 那两轮连降级，28 秒内叫了两次「主人——」、
+    // 还发了「（睡醒了，尾巴甩了一下）」这种括号动作 —— 全是降级时才有的。
+    // 再要一次纯 JSON，只在降级时发生（今天约 24% 的轮次），一次 ¥0.001 量级。
+    if (actions && actions.__degraded) {
+      try {
+        log('[lite] ' + key + ' 输出不是 JSON（降级），重试一次要求纯 JSON');
+        const retryUser = userText
+          + '\n\n【必须按格式】你上一轮的输出不是 JSON 对象。这一轮**只输出一个 JSON 对象**，'
+          + '不要解释、不要代码块、不要 JSON 以外的任何文字。字段照上面的说明填，没内容就省略。';
+        const retry = await callLiteApi(lc, systemPrompt, retryUser, imageParts, imgFrom);
+        const retryActions = parseLiteActions(retry.text);
+        if (retryActions && !retryActions.__degraded) {
+          actions = retryActions;
+          result = retry; // 让 drill/dump 记下真正生效的那一次
+          log('[lite] ' + key + ' 重试拿到 JSON，按正式动作执行');
+        } else {
+          log('[lite] ' + key + ' 重试仍是纯文本，按降级处理');
+        }
+      } catch (error) {
+        log('[lite] ' + key + ' 降级重试失败（不影响这轮）: ' + (error?.message ?? error));
+      }
+    }
     // 她自己说「这个我不懂/想不起来」并给了关键词：先翻旧记录（本地、0 成本），
     // 翻到了就带着往事重说一次。只重试一次，第二次无论有没有都不再触发。
     if (!sweep) {
@@ -9889,7 +9989,9 @@ async function main() {
         nameMention: w.recommendedNameMention !== false,
         speakerIds: [],
         keywords: Array.isArray(w.recommendedKeywords) ? w.recommendedKeywords.map(String) : [],
-        question: w.recommendedQuestion !== false,
+        // 2026-10-27 起默认关闭：问句触发与在场窗口重复，还会把「别人问别人」当成问她
+        // （详见 evaluateWakeTriggerV2 里 question 分支的说明）。
+        question: w.recommendedQuestion === true,
         poke: w.recommendedPoke !== false,
         anyMessage: defaultMode === 'active',
         probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0))
@@ -12007,7 +12109,14 @@ async function main() {
         }
       }
     }
-    if (tr.question && isDirectedAtAi(plainContent)) return 'question';
+    // 2026-10-27 主人拍板：问句唤醒机制不需要，去掉。
+    // 理由：①新话题的提问者会 @ 或叫名字，atMention / nameMention 已经覆盖；
+    // ②话题进行中的问句由在场窗口 shouldJoinConversationV2 的第②条接住。
+    // 留着它只有一个实际效果——别人问别人的问题，只要话里带「你……怎么……」就把她叫醒。
+    // 当天 20:35 的实例：群友C问「你感觉你性格怎么样」其实是问另一个机器人，
+    // 她被打醒后抢答「软呀 / 但急了会咬人」，而那条 @另一个机器人 4 秒后才到。
+    // 需要恢复时把 cfg.socialV2.wake.questionTrigger 设为 true。
+    if (cfg.socialV2?.wake?.questionTrigger === true && tr.question && isDirectedAtAi(plainContent)) return 'question';
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
       const speakerId = String(event?.user_id ?? event?.sender?.user_id ?? '');
       if (speakerId && tr.speakerIds.some((id) => String(id) === speakerId)) {
@@ -13099,6 +13208,10 @@ async function main() {
 
   function scheduleProactiveCheckV2(key) {
     scheduleHealthCheck();
+    // 私聊不主动冒泡（2026-10-26 主人拍板）：「如果私聊中和她对话的人想聊天了会主动找的，
+    // 所以不用冒泡功能」。这个定时器的本质就是「没话找话」—— 你安静 8 分钟它就掷骰子，
+    // 实测一天催了 5 次、全是「主人你在干嘛」「主人还在上课吗」。私聊就该有事说事。
+    if (String(key).startsWith('private:')) return;
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
@@ -13276,7 +13389,7 @@ async function main() {
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     // 只有桥接自己的这几个命令才拦。别的以 / 开头的一律当聊天 ——
-    // 2026-10-26 实测：她教群友「@某bot /今日老婆」，群友照发，被这句
+    // 2026-10-26 实测：她教群友「@某个机器人 /今日老婆」，群友照发，被这句
     // 「管理命令仅管理员可用」吃掉：她自己在教的东西，被自己的拦截器拦了。
     const KNOWN_ADMIN_CMD = /^\/(?:reset|new|status|role|人格|silent|quiet|active|speak)(?:\s|$)/;
     if (plainContent.startsWith('/') && KNOWN_ADMIN_CMD.test(plainContent)) {
@@ -13703,7 +13816,15 @@ async function main() {
       saveSocialV2State();
       scheduleWakeV2(key, 'bootstrap');
     } else if (st.wakeConfig?.triggers?.poke) {
-      scheduleWakeV2(key, 'poke');
+      // 2026-10-27 修复：群里「A 拍 B」同样会推 poke 事件。以前这里只看 triggers.poke，
+      // 不判断 target_id，于是任何一次拍别人都会把她叫醒，prompt 里还写成「X 拍了你一下」——
+      // 表现为「群友C拍另一个机器人 → 她当成拍自己 → 连问『那你拍的是谁呀』」。
+      // 有 target_id 就严格比对；老运行时可能不传 target_id，那种情况才保守放行（宁可多醒一次）。
+      if (targetIsSelf || !targetId) {
+        scheduleWakeV2(key, 'poke');
+      } else {
+        appendActivity(key + ' 拍一拍没拍我（' + sender + ' -> ' + targetId + '），不唤醒');
+      }
     }
   }
 
