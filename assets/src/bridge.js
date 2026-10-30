@@ -2020,15 +2020,17 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
+  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, skipBudget = false } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
     const resolved = resolveVoicePathForV2(voiceRef);
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
-    voiceBudgetCheck(key, vc);
+    // 唱歌分段这类「一次动作拆成多条」不该按条扣语音额度：
+    // 否则 maxPerMinute=2 时一首 3 段的歌第 3 段必被拦（2026-10-29 实测）。
+    if (!skipBudget) voiceBudgetCheck(key, vc);
     const sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
-    voiceBudgetCommit(key);
+    if (!skipBudget) voiceBudgetCommit(key);
     recordVoiceSentV2(key, sent, label);
     log(`[voice] ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}, messageId=${sent.messageId ?? '?'})`);
     appendActivity(`${key} [voice] 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
@@ -4384,7 +4386,10 @@ async function main() {
     if (!hit) return null;
     const file = String(hit.file || '').trim();
     if (!file) return null;
-    return { name: String(hit.name), rel: path.posix.join('songs', file.split(/[\\/]/).pop()), half: hit.half === true };
+    // 一整首发不完时可以分段：songs.json 里给这条加 "parts": ["xxx-1.mp3","xxx-2.mp3", ...]
+    const norm = (f) => path.posix.join('songs', String(f || '').split(/[\\/]/).pop());
+    const parts = Array.isArray(hit.parts) ? hit.parts.map(norm).filter(Boolean) : null;
+    return { name: String(hit.name), rel: path.posix.join('songs', file.split(/[\\/]/).pop()), half: hit.half === true, parts };
   }
 
   function songsHint() {
@@ -4618,8 +4623,22 @@ async function main() {
         if (!song) {
           report.errors.push(`曲库里没有「${want}」`);
         } else {
-          const sentSong = await sendVoiceForV2(key, song.rel, { label: `[唱歌] ${song.name}` });
-          report.sing = { name: song.name, messageId: sentSong.messageId ?? null };
+          // 2026-10-29：一整首超过 QQ 语音条能装的长度时就分开发，每段一条语音、中间留 1.5 秒。
+          if (Array.isArray(song.parts) && song.parts.length > 1) {
+            const ids = [];
+            for (let i = 0; i < song.parts.length; i += 1) {
+              const sentPart = await sendVoiceForV2(key, song.parts[i], {
+                label: `[唱歌] ${song.name}（${i + 1}/${song.parts.length}）`,
+                skipBudget: true
+              });
+              ids.push(sentPart.messageId ?? null);
+              if (i < song.parts.length - 1) await sleep(1500);
+            }
+            report.sing = { name: song.name, parts: ids.length, messageIds: ids };
+          } else {
+            const sentSong = await sendVoiceForV2(key, song.rel, { label: `[唱歌] ${song.name}` });
+            report.sing = { name: song.name, messageId: sentSong.messageId ?? null };
+          }
           st.lastActionAt = Date.now();
         }
       } catch (error) {
@@ -5330,8 +5349,16 @@ async function main() {
     // 先登记「这一轮给模型看过哪些消息」，再算水位。
     // 不登记的话 modelSeenSeqs 是空的 ⇒ readThroughSeqV2() 算出 0 ⇒ 收尾传任何真实水位
     // 都会被判「超过已展示连续消息水位」而拒绝（实测 markThroughError、unread 卡住 9 条）。
-    const seenThrough = Array.isArray(snapshot?.messages) && snapshot.messages.length
-      ? noteModelMessagesV2(st, snapshot.messages)
+    // 附了图的那些消息也要一起登记（2026-10-30）：图是单独作为图片本体喂进去的，
+    // 不登记的话水位跨不过那条图片消息 ⇒ 它一直留在 unread ⇒ 下一轮 collectWakeMediaV2
+    // 又把它取出来附一遍（实测 19:32:35 附了 seq 3876、水位停 3875，19:33:00 又附了一次）。
+    const mediaStubs = [...mediaSeqs].map((seq) => ({ seq }));
+    const seenMessages = [
+      ...(Array.isArray(snapshot?.messages) ? snapshot.messages : []),
+      ...mediaStubs,
+    ];
+    const seenThrough = seenMessages.length
+      ? noteModelMessagesV2(st, seenMessages)
       : null;
     st.__liteReadThrough = Number.isSafeInteger(seenThrough)
       ? seenThrough
@@ -6786,7 +6813,13 @@ async function main() {
         && wakeState.agentToken === wakeToken) {
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
-      noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
+      // 附了图的那几条也一起登记（2026-10-30）：图是单独喂进去的，不登记水位就跨不过
+      // 那条图片消息，它会留在 unread 里被下一轮再取一次。
+      noteModelMessagesV2(wakeState, [
+        ...wakeSnapshot.messages,
+        ...wakeSnapshot.recent,
+        ...(Array.isArray(opts.media) ? opts.media : []).map((m) => ({ seq: m && m._seq })),
+      ]);
     }
     if (accepted.result.value.command?.text && !opts.silent && currentMode !== 'reserved2') {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
@@ -7807,7 +7840,11 @@ async function main() {
           if (st.lastPartnerUserId && String(m.userId || '') === String(st.lastPartnerUserId)) return true;
           let hit = 0;
           for (const g of bigrams(t)) if (mineGrams.has(g) && !TOPIC_STOP_GRAMS.has(g)) hit += 1;
-          if (hit >= 1) return true;
+          // 2026-10-29：门槛从 1 提到 2。原来看语料只要撞上一个大词就当成「在接她」，
+          // 于是群里连续抽卡（每次都换角色/换图，词表几乎不重）她照样能一路蹭着接下去：
+          // 实测 15:45~16:00 连说 4 轮，全是「粉头发」「羊角」这种外观点评。
+          // 撞 2 个才算接她，和上面「话题接力」（④）用同一个口径。
+          if (hit >= 2) return true;
         }
         // 有人说话、但没一条是在接她 —— 这轮对话跟她无关，别插。
         log('[presence] 有人说话但没在接她，跳过插话');
@@ -7972,14 +8009,24 @@ async function main() {
     // （「诶这次没蒙眼」「这次是关笼子里了」「这张我穿的女仆装诶」）。
     // 修法：① 主动唤醒干脆不带图（没有新内容就别硬聊）；② 万不得已回退时，
     // 只保留已读水位之后的消息，绝不重复消费同一张图。
+    // 2026-10-30 修：**已经给模型看过的图不再附第二遍**。
+    // 实测 19:32:35 那轮附了某群友的图（seq 3876）、收尾水位只到 3875，于是 19:33:00
+    // 那轮又从 unread 里把同一张图取出来附了一次 —— 她对着同一张图说了两遍，
+    // 第二次还自己补了句「这张图我看出来了」。上面那条「绝不重复消费同一张图」
+    // 当时只在 recent 回退分支写了，unread 分支漏了；现在两条分支都按 modelSeenSeqs 过滤。
+    const seenSeqs = st?.modelSeenSeqs instanceof Set
+      ? st.modelSeenSeqs
+      : new Set(Array.isArray(st?.modelSeenSeqs) ? st.modelSeenSeqs : []);
+    const notSeenByModel = (m) => !(m && seenSeqs.has(Number(m.seq)));
     let src;
     if (unread.length) {
-      src = unread.slice(-8).reverse(); // 新的优先
+      src = unread.filter(notSeenByModel).slice(-8).reverse(); // 新的优先，且跳过已经看过的
     } else if (opts.allowRecentFallback === false) {
       src = [];
     } else {
       src = recent
         .filter((m) => m && !m.isSelf && (!mark || Number(m.seq) > mark))
+        .filter(notSeenByModel)
         .slice(-8)
         .reverse();
     }
