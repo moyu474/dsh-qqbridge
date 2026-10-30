@@ -4684,8 +4684,8 @@ async function main() {
           if (actions.replyTo !== undefined && actions.replyTo !== null && String(actions.replyTo).trim() !== '') {
             const rawReplyTo = String(actions.replyTo).trim();
             rawReplyToText = rawReplyTo;
-            // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（2026-10-22 实测填过
-            // 「。(1234567890)」，于是 replyTo 解析失败、该引用的没引用）。
+            // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（实测填过
+            // 「某群友(1234567890)」，于是 replyTo 解析失败、该引用的没引用）。
             // 所以先把它拆成昵称 / 号码两种写法各试一遍。
             const cands = [rawReplyTo];
             const m = rawReplyTo.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);

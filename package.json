@@ -34,6 +34,13 @@
       "patch": "./cordis.patch.yml"
     }
   },
-  "repository": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moyu474/dsh-qqbridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/moyu474/dsh-qqbridge/issues"
+  },
+  "homepage": "https://github.com/moyu474/dsh-qqbridge#readme",
   "author": "dsh-qqbridge contributors"
 }
