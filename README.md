@@ -44,8 +44,10 @@
 
 ## 安装
 
+本插件未发布到 npm，从 GitHub 装：
+
 ```bash
-dsh plugin --profile web add dsh-qqbridge
+dsh plugin --profile web add github:moyu474/dsh-qqbridge
 ```
 
 装完重启 `dsh web`。
