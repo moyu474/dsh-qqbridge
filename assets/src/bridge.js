@@ -5279,12 +5279,20 @@ async function main() {
     // 放在前面是因为 callLiteApi 只取前 3 张图，视频内容才是这轮的重点。
     try {
       const videoSrc = videoMod.findVideoSourceV2(st);
-      if (videoSrc) {
+      // 2026-10-31：同一个视频只抽一次。原来每轮都能重新找到同一个 B 站卡片，
+      // 于是 22:17 和 22:56 两轮各抽了一遍同一段 31 秒视频，她连着说了两遍
+      // 「塔罗牌贴脸，眼睛好亮」（第二遍还改成「第5格」）。
+      const vKey = videoSrc ? String(videoSrc.source || '').slice(0, 200) : '';
+      const vSeen = new Set(Array.isArray(st.videosSeen) ? st.videosSeen : []);
+      if (videoSrc && vSeen.has(vKey)) {
+        log('[video] 这个视频之前抽过了，跳过：' + vKey.slice(0, 60));
+      } else if (videoSrc) {
         log('[video] 发现视频（' + videoSrc.kind + '），开始抽帧：' + String(videoSrc.source).slice(0, 80));
         const sheet = await videoMod.videoToSheet(videoSrc.source);
         if (sheet && sheet.buffer) {
           imageParts.unshift({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: 'video-sheet.jpg', _from: '视频抽帧拼图', _videoNote: String(sheet.note || '') });
           imgFrom.unshift({ name: '视频抽帧拼图' });
+          st.videosSeen = [...(Array.isArray(st.videosSeen) ? st.videosSeen : []), vKey].slice(-20);
         }
       }
     } catch (error) {
@@ -8046,9 +8054,15 @@ async function main() {
       ? st.modelSeenSeqs
       : new Set(Array.isArray(st?.modelSeenSeqs) ? st.modelSeenSeqs : []);
     const notSeenByModel = (m) => !(m && seenSeqs.has(Number(m.seq)));
+    // 2026-10-31 修：取图范围要和**这轮真的会展示的消息**对齐。
+    // 原来图取 unread 最新的（slice(-8)），消息却取最旧的（wakeMessageLimit 条）——
+    // 消息积压时两边完全错位：她拿到一张图、上下文里却没有那条消息，
+    // 只能猜是谁发的，于是把刘森发的视频安到最近说话的芬恩头上（实测 21:06）。
+    // 现在只在「本轮会展示的那批消息」里取图，图一定有对应的发送人。
+    const ctxLimit = Math.max(1, Number(cfg.socialV2?.context?.wakeMessageLimit) || 12);
     let src;
     if (unread.length) {
-      src = unread.filter(notSeenByModel).slice(-8).reverse(); // 新的优先，且跳过已经看过的
+      src = unread.filter(notSeenByModel).slice(0, ctxLimit).reverse(); // 与上下文同批，新的优先
     } else if (opts.allowRecentFallback === false) {
       src = [];
     } else {
