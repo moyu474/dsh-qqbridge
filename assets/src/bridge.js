@@ -4320,6 +4320,7 @@ async function main() {
   "liking": 0,
   "remember": { "who": "对方的QQ号或昵称", "note": "一句话印象，20字以内" },
   "recall": "你有读不懂/不知道/想不起来的东西时，把要查的关键词写这里（一个梗、一个名字、一件旧事）；查得到就把旧对话给你",
+  "research": "拿不准的事实题写这里（定义、数字、谁做的、哪一年、现在什么版本、这梗的出处），桥接会去搜，搜到再让你重说一次",
 {{VOICE_FIELD}}
   "markThrough": 读到的水位 seq,
   "wake": { "mode": "diving", "minutes": 45 }
@@ -4349,6 +4350,7 @@ async function main() {
 - 有人问正经问题（是什么、为什么、怎么办、某个知识）就**直接答**：一两句话说清，别拿怼或者反问糊过去；不知道就说不知道，别硬编。
 - **对方问「还记得…吗」「怎么…」「在哪」这种问句，第一句就先回答那个问题**。哪怕他同时发了图，也先答问题、再顺嘴提一句图；反过来先描述半天图、把问题晾着，就是答非所问。
 - **不懂就先问自己**：有人提到你没听过的梗、名字、东西，或者你突然想不起群里以前说过什么，就把关键词写进 recall（几个词就够，写你真正不懂的那部分，别抄整句）。翻得到旧记录会把对话给你；翻不到就照实说「记不清了」，别编。**但别一声不吭**：想不起来的时候先写 recall 再说话，沉默只会像没听见。
+- **事实题先别急着凭印象答**：有人问知识（"X 是什么""为什么""哪一年""现在什么版本"），尤其**你脑子里只有一个最常见的模板**时，先把问题原样写进 research，搜完再答。例子：「原初黑洞是什么」——别直接说"恒星坍缩"，那是普通黑洞的模板，原初黑洞是宇宙刚诞生时物质挤塌出来的，差得很远（2026-10-31 实测就答错了这一次）。闲聊、情绪、玩梗不用填 research，那是浪费。
 - 群里发的图你是看得见内容的：直接说图里是什么、写了什么字，别点评清晰度（"糊""包浆"这种话别顺嘴说）；真看不清就说"看不清"。
 - **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
 - **私聊是私聊，群聊是群聊**：你记得私聊里说过的事（那是你和主人的事），但在群里**绝不能说出来** —— 不能提「你上次私聊跟我说」「我们私下聊的那个」，不能复述任何细节。被人追问就装傻：把私聊内容漏到群里，等于出卖人。反过来，私聊里可以放心提群里的事（那是大家都知道过的）。
@@ -5330,6 +5332,25 @@ async function main() {
           log(`[recall] ${key} 她想不起来「${askRecall.slice(0, 30)}」→ 旧记录里没有`);
         } catch (error) {
           log('[recall] 自查检索失败（不影响这轮）: ' + (error?.message ?? error));
+        }
+      }
+    }
+    // 她自己标了「这题我拿不准」→ 搜一次（本地库优先，没命中才联网），带着结果重说一遍。
+    // 2026-10-31 加：原来只有关键词白名单能触发搜索，像「原初黑洞是什么」这种
+    // 一个词都命不中，她就拿"黑洞=恒星坍缩"的模板直接答错。现在她有权自己叫搜索。
+    // 只搜一次：research 已有值就不再搜，避免来回循环。
+    if (!sweep && !research) {
+      const askResearch = (Array.isArray(actions.research) ? actions.research.join(' ') : String(actions.research ?? '')).trim().slice(0, 80);
+      if (askResearch && !/^(null|undefined|none|无|没有|空)$/i.test(askResearch)) {
+        try {
+          const r = await researchFor(askResearch, key);
+          if (r?.text) {
+            log(`[research] ${key} 她拿不准「${askResearch.slice(0, 30)}」→ ${r.source === 'kb' ? '本地库' : '联网'} ${r.hits ?? r.items ?? 0} 条，重说一次`);
+            return deliverLiteV2(key, reason, media, r, { block: '' });
+          }
+          log(`[research] ${key} 搜「${askResearch.slice(0, 30)}」没结果，按原样答`);
+        } catch (error) {
+          log('[research] 搜索失败（不影响这轮）: ' + (error?.message ?? error));
         }
       }
     }
@@ -6693,10 +6714,8 @@ async function main() {
   }
 
   /** 为本轮最后一条消息做一次检索：命中本地库就不花钱，否则搜一次并存档。 */
-  async function researchForKey(key) {
-    const st = getSocialV2State(key);
-    const last = (Array.isArray(st.unread) ? st.unread : []).slice(-1)[0];
-    const query = String(last?.text ?? last?.plain ?? '').replace(/\s+/g, ' ').slice(0, 120).trim();
+  async function researchFor(rawQuery, key = '') {
+    const query = String(rawQuery ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
     if (!query) return null;
     const hits = searchKnowledge(loadWebKnowledge(), query, {});
     if (hits.length) {
@@ -6709,6 +6728,13 @@ async function main() {
     }
     log(`[web] ${key} 搜索「${query.slice(0, 24)}」→ ${r.items.length} 条 / ${r.ms}ms`);
     return { source: 'web', query, text: formatKnowledge(r.items.map((it) => ({ record: makeRecord({ q: query, ...it }), score: 1 }))), items: r.items.length, usage: r.usage };
+  }
+
+  /** 老入口：拿最后一条未读当查询词（关键词白名单触发的那条路）。 */
+  async function researchForKey(key) {
+    const st = getSocialV2State(key);
+    const last = (Array.isArray(st.unread) ? st.unread : []).slice(-1)[0];
+    return researchFor(last?.text ?? last?.plain ?? '', key);
   }
 
   async function deliverPromptNow(key, promptText, opts = {}) {
