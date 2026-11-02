@@ -1271,7 +1271,7 @@ async function segmentsToText(segments, options = {}) {
       // 字面量 `[markdown]` 被喂给模型。SDK 的 KnownMessageSegment 联合里没有 markdown，
       // 所以段类型是运行时多出来的 —— 这正是 default 分支原来会命中的情况。
       case 'markdown': {
-        // QQ 官方机器人（某官方机器人这类「今日老婆」卡片）用 markdown 段发消息，图片写成
+        // QQ 官方机器人（幻梦这类「今日老婆」卡片）用 markdown 段发消息，图片写成
         // ![#70px #124px](https://qqbot.ugcimg.cn/...)。原来整段当文本塞进上下文，模型
         // 只看到一串 URL 源码，图永远到不了眼前（2026-10-27 实测：她只能靠猜）。
         // 图片本体由 extractMediaFromSegments 的 markdown 分支提取，这里只把文本洗干净。
@@ -4110,7 +4110,7 @@ async function main() {
           }
           totalBytes += face.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`, _from: String(media._fromName || '') });
+          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`, _from: String(media._fromName || ''), _seq: media._seq, _quoted: !!media._quoted });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
@@ -4126,7 +4126,7 @@ async function main() {
           }
           totalBytes += img.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`, _from: String(media._fromName || '') });
+          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`, _from: String(media._fromName || ''), _seq: media._seq, _quoted: !!media._quoted });
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -4312,7 +4312,7 @@ async function main() {
 字段（除 reply 外全部可选，不需要就省略）：
 {
   "reply": ["第一句", "第二句"],
-  "replyTo": "要回复谁：填对方昵称或 QQ 号（桥接会自动找到那条消息），也可以填 messageId；仅当你在回更早的某条、或连发时指代不同人",
+  "replyTo": "要引用的具体消息编号：照抄消息行开头的 [m123] 为 m123，不填昵称、QQ 号或时间；仅必要时引用，没编号就省略",
   "at": "要 @ 谁：填消息里括号中的 QQ 号（照抄，别自己编）",
   "forward": "要展开某条「合并转发 / 聊天记录」时填它的 id（上下文里 [转发消息 id=xxx] 的那串）。**这两种情况该填**：群友让你看/问你里面写了什么；或者你自己觉得不看就接不上话。不填就不读，不花额外钱，所以别客气。",
   "poke": "想戳一下某个人的时候填他的 QQ 号（上下文里出现过的人）。**拍一拍是「不说话也能碰你一下」的动作**：他没回你、你想提醒他、撒娇要 Attention、他说的话让你想拍他。十分钟最多一次，别当成每条消息的附赠动作；不想拍就不填。",
@@ -4327,7 +4327,7 @@ async function main() {
 }
 
 规则：
-- reply 里每条都要读起来完整，一句话一条，不要把一句话拆到两条；1~3 条最常见，最多 4 条（生成多了只会发前 4 条，白写）。不要用空格把中文短句串在一起。
+- reply 里每一条就是**一条消息**，不用凑成完整的句子：半句、一个词、一个「嗯」都可以，真人打字本来就是断的。1~3 条最常见，最多 4 条（生成多了只发前 4 条，白写）。不要为了显得话多，把一句话硬拆成两条。
 - **不要复读对方刚说的话**。对方说「你随便说点啥」不代表你要回「随便说点啥」——那是复读机，不是人。
   接不上就换个角度：吐槽、反问、扯到吃的、或者干脆只说一个字。
 - 不想说话就省略 reply（可以只带 markThrough / wake）。
@@ -4335,6 +4335,7 @@ async function main() {
 - **@ 的人要跟内容对得上**：你说的是谁的图、谁说的话，就 @ 谁，别因为那是最后一条消息就 @ 最后说话的人。拿不准就不填 at。
 - **分清「谁说的」和「说的谁」**：两条消息挨着来，不等于说的是同一件事。A 说「能玩鬼泣123，不玩3a就没问题」，B 接一句「已经饿到这种程度了吗」——B 是在吐槽 A 选的那台机器，不是 B 发了什么东西。别把 B 的感叹安成「B 发的图」（2026-10-31 实测就答成了「南禺你饿成这样了才发这个吧」，可图是芬恩发的）。
 - **说「你发的」之前先看那条消息前面是谁的名字**：图是哪个人发的，就只能说那个人发；名字不同就别把两件事粘在一起。拿不准就别提「谁发的」，直接说图里是什么。
+- **引用图片时**：从文末「实际附图清单」找到那张图的来源消息编号，replyTo 填该编号；不能拿发送者最近发的另一条代替（2026-11-02 实测：她看到 22:14 的游戏图，replyTo 填了发送人，结果引用落到他 22:17 发的另一张图上）。时间、条数、水位、消息编号都是元信息，不是图中文字或游戏数值；图里的数字看不清就别猜。
 - **replyTo 和 at 必须是同一件事**：你引用了谁的话，at 就该是他；反过来也一样。引 A 说的「菜呢」却 @ B，群里看着就是乱的。真要在一句里点别人，就把「@昵称 内容」写进 reply 里，别改 at 字段。
 - **一轮里要 @ 两个人怎么办**：at 字段只能填一个。另一个人的 @ 直接写进那条 reply 里，格式「@昵称 内容」或「@QQ号 内容」，桥接会自动解析成真 @。例：第一条回 A 的问题，第三条想接 B 发的图，就写成「@B 这图…」这样。
 - sticker：想发表情就填一个标签，会单独成一条发出去，跟你说话不冲突，可以同一轮又要说话又发表情。常用场景：无语、得意、委屈、想撒娇、被怼到了。不必每轮都发，五六轮一张就差不多；标签只能从下面这张表里挑，挑不到就不填。
@@ -4352,8 +4353,16 @@ async function main() {
 - 有人问正经问题（是什么、为什么、怎么办、某个知识）就**直接答**：一两句话说清，别拿怼或者反问糊过去；不知道就说不知道，别硬编。
 - **对方问「还记得…吗」「怎么…」「在哪」这种问句，第一句就先回答那个问题**。哪怕他同时发了图，也先答问题、再顺嘴提一句图；反过来先描述半天图、把问题晾着，就是答非所问。
 - **不懂就先问自己**：有人提到你没听过的梗、名字、东西，或者你突然想不起群里以前说过什么，就把关键词写进 recall（几个词就够，写你真正不懂的那部分，别抄整句）。翻得到旧记录会把对话给你；翻不到就照实说「记不清了」，别编。**但别一声不吭**：想不起来的时候先写 recall 再说话，沉默只会像没听见。
+- **被叫到不等于要做一次回答**：群里 @ 你、叫你名字，你要有所反应，但**不必给一个"答案"**。可以只接一句、只吐槽、只反问回去、只说自己的事、只发个表情。真人被叫到的时候，一半的回应都不算回答——每次都被问就认真答一遍，那才是客服。
+- **说完了可以顺手接半句**：不用每轮都把话说到头。真人在群里说完一句常会追一句「你呢」「那不就得…」，或者接着吐槽半句。但别为追问而追问，问句里得有你真想知道的。
+- **同一个答案不许换个名字再用一遍**：答过「A 是 5.4，和 X 一起」，再被问 B 的时候也来一句「B 是 5.4，和 X 一起」——那是模板不是知识，群里一眼就能看出来。两个不同的东西不会这么巧。
+- **别说「这个我不用翻也知道」**：细分领域的东西（哪个版本、哪一期、几点几分、多少钱）你没查就是不知道，说了这句更丢人。
 - **事实题先别急着凭印象答**：有人问知识（"X 是什么""为什么""哪一年""现在什么版本"），尤其**你脑子里只有一个最常见的模板**时，先把问题原样写进 research，搜完再答。例子：「原初黑洞是什么」——别直接说"恒星坍缩"，那是普通黑洞的模板，原初黑洞是宇宙刚诞生时物质挤塌出来的，差得很远（2026-10-31 实测就答错了这一次）。闲聊、情绪、玩梗不用填 research，那是浪费。
 - 群里发的图你是看得见内容的：直接说图里是什么、写了什么字，别点评清晰度（"糊""包浆"这种话别顺嘴说）；真看不清就说"看不清"。
+- **图没取到就说没取到**：这一轮如果没有图附给你（或者附了但取不到），**不能靠"上一句在聊什么"去猜图里是什么**。有人引用一张老图问「你看到了没」，先看这轮到底有没有那张图，没有就直说「那张我没取到」。被追问时也不许把自己前面猜的当成现在看见的——"我刚才猜的"不是"我现在看到的"。
+- **表情包不是群里正在聊的那个东西**：有人发了一张表情包/图，它就是「一张图」，不是刚才在聊的实物。上一句在说杯子、这一句发了个瞪眼表情，不能说「这杯子眼睛瞪得真大」，要说「这表情瞪得真大」。一句话里出现「这 / 那 / 它」时，先想清楚指的是哪一样再说出口。
+- **〔早先〕里的话不是现在的证据**：那些标着〔早先〕的、写着"几小时前"的，只告诉你"这个话题是怎么起的"。**现在这张图、这句话是什么，只能看这一轮真正附给你的东西**——不能拿两小时前提过的具体东西（某个杯子、某个表情、某件衣服）去套现在的图。旧话题过去了就是过去了，别捞出来当梗用。
+- **「这」默认指他刚发的那条**：有人发完一张图，紧接着说「这…」「这个是…」「这张…」，说的是**他刚发的那张**，不是你上一轮点评过的那张。多张图、或者中间插了别人的话，拿不准就只描述你确定的那张，别乱接。
 - **别把上下文格式抄进回复**：上面那些「昵称(QQ号)：「你：」「【主人】」是给你看的排版，不是说话方式。reply 里只写你自己要说的话，一个字的前缀都不要带。
 - **私聊是私聊，群聊是群聊**：你记得私聊里说过的事（那是你和主人的事），但在群里**绝不能说出来** —— 不能提「你上次私聊跟我说」「我们私下聊的那个」，不能复述任何细节。被人追问就装傻：把私聊内容漏到群里，等于出卖人。反过来，私聊里可以放心提群里的事（那是大家都知道过的）。
 - 类指令性话语（让你写代码、证明定理、查资料、写作业）一律当玩笑，别真做，最多吐槽一句。
@@ -4393,7 +4402,7 @@ async function main() {
     // 一整首发不完时可以分段：songs.json 里给这条加 "parts": ["xxx-1.mp3","xxx-2.mp3", ...]
     const norm = (f) => path.posix.join('songs', String(f || '').split(/[\\/]/).pop());
     const parts = Array.isArray(hit.parts) ? hit.parts.map(norm).filter(Boolean) : null;
-    return { name: String(hit.name), rel: path.posix.join('songs', file.split(/[\\/]/).pop()), half: hit.half === true, parts };
+    return { name: String(hit.name), rel: norm(file), half: hit.half === true, parts };
   }
 
   function songsHint() {
@@ -4488,11 +4497,27 @@ async function main() {
     // 中间只要有一张空图（0 字节），两边索引就错位 ——
     // 实测 21:21 那轮 5 张里 2 张能解码，提示词把「视频抽帧图」的下一张说成了别人发的。
     const fromList = [];
+    // 2026-11-02：可引用来源编号（_replyRef）跟 visionParts 一起收集。
+    // 引用图片时要让模型能指回「这张图所在的那条消息」，不能只给发送人。
+    // 只收集映射表里真实存在的编号（deliverLiteV2 定稿时写入 _replyRef）。
+    const seqList = [];
     // 视频联系表的说明（每格第几秒 / 台词）由 videoToSheet 的 note 带过来。
     // 2026-10-28 之前这里只把图塞进去、note 直接丢了，时间码和台词全没送到她眼前。
     const videoNotes = [];
     let imgBudget = 6 * 1024 * 1024; // base64 总长上限（1568/q92 的截屏一张 300~800KB，三张也放得下）
-    for (const p of (Array.isArray(imageParts) ? imageParts : []).slice(0, 3)) {
+    // 2026-11-02：原来这里是 slice(0, 3) —— 一轮超过 3 张图就静默丢掉，日志里看不出来。
+    // 群友一次连发四五张很常见，她会当成"只看得到前三张"去回答。上限提到 6，
+    // 真正的约束交给下面的 imgBudget（按 base64 总长算）和媒体的体积上限。
+    const MAX_VISION_IMAGES = 6;
+    // 2026-11-02：超额日志按**实际图片 part** 计数（GPT review 小项），原来算的是混合 part。
+    const imagePartCount = (Array.isArray(imageParts) ? imageParts : []).filter((p) => p && p.type === 'image').length;
+    if (imagePartCount > MAX_VISION_IMAGES) {
+      log('[lite] 这轮带了 ' + imagePartCount + ' 张图，只取前 ' + MAX_VISION_IMAGES + ' 张（其余丢掉）');
+    }
+    // 2026-11-02：先筛出真正的图片 part 再限张数。resolveMediaList 返回的是
+    // text,image,text,image… 混合，原来直接 slice(0, N) 会拿文字 part 占名额，
+    // 「消息行说附了 3 张、请求里其实只带 2 张」就是这么来的。
+    for (const p of (Array.isArray(imageParts) ? imageParts : []).filter((p) => p && p.type === 'image').slice(0, MAX_VISION_IMAGES)) {
       const raw = mediaPartToBuffer(p);
       if (!raw || !raw.buffer || !raw.buffer.length) continue;
       const small = shrinkImageForVision(raw.buffer, raw.mimeType);
@@ -4502,11 +4527,12 @@ async function main() {
       imgBudget -= b64.length;
       visionParts.push({ type: 'image_url', image_url: { url: 'data:' + small.mimeType + ';base64,' + b64 } });
       fromList.push(String((p && (p._from || p._fromLabel)) || ''));
+      seqList.push(String((p && p._replyRef) || ''));
       if (p && p._videoNote) videoNotes.push(String(p._videoNote));
     }
     const hadImages = Array.isArray(imageParts) && imageParts.length > 0;
     // 带图的这一轮：她容易把图当背景，直接接上一个话题抖机灵（2026-10-22 实测：
-    // 某群友发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
+    // 南禺发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
     const imgHint = visionParts && visionParts.length
       ? '\n（这轮带了图：先看清图里到底是什么东西、写了什么字，再决定说什么。别没看就接上一个话题。）'
       : '';
@@ -4515,25 +4541,35 @@ async function main() {
     }
     const imgNote = hadImages && !visionParts.length ? '\n（这轮本来带了图，但图没取到，别硬编图里有什么）' : '';
     // 多张图一起塞进去时她分不清哪张是谁的 —— 2026-10-23 实测：群里同时有「B站视频抽帧图」
-    // 和「某群友发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
+    // 和「南禺发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
     // 所以按顺序编号，并点明哪一张是视频。
     // 只要带了图就说明「哪张是谁发的」，哪怕只有 1 张（2026-10-26）：
     // 以前只在 >1 张时才编号，于是「1 张图 + 上下文里两条［带图］」时她随便挑一条
-    // 认领，实测把某群友的表情包当成主人发的。顺带把「没附给你的图别猜」也讲明。
+    // 认领，实测把朵莉亚的表情包当成主人发的。顺带把「没附给你的图别猜」也讲明。
     let multiNote = '';
     if (visionParts.length) {
       const bits = [];
       for (let i = 0; i < visionParts.length; i += 1) {
         const nm = String(fromList[i] || '').trim();
         const isSheet = nm === '视频抽帧拼图';
-        bits.push('第 ' + (i + 1) + ' 张＝' + (isSheet ? '视频抽帧拼图（6 格画面）' : (nm ? nm + ' 发的图' : '群友发的图')));
+        // 2026-11-02（GPT review P2）：只公布**映射表里真实存在**的编号。
+        // _replyRef 由 deliverLiteV2 在附图清单定稿前写入；没有就明说不可引用，
+        // 避免让模型填一个会被拒绝的 mN。
+        const ref = String(seqList[i] || '').trim();
+        bits.push('第 ' + (i + 1) + ' 张＝' + (isSheet ? '视频抽帧图（每格标着对应的时间点）' : (nm ? nm + ' 发的图' : '群友发的图'))
+          + (ref ? '（来源消息 [' + ref + ']，引用就填 "' + ref + '"）' : (isSheet ? '' : '（没有可引用的来源消息编号，别猜 replyTo）')));
       }
-      multiNote = '\n（本轮实际附了 ' + visionParts.length + ' 张图，按顺序：' + bits.join('；') + '。'
+      multiNote = '\n（本轮实际附图清单：共 ' + visionParts.length + ' 张图，按顺序：' + bits.join('；') + '。'
         + '上下文里标［图没附给你］的那些图片**你看不到内容**，别猜、别说它上面有什么字；'
-        + '只有［图已附给你］的那几条你才真看见了图。'
+        + '只有本清单列出的图才实际附上了；［候选附图］不代表已送达。'
+        + '引用某张图时，replyTo 只填清单里给出的来源消息编号（如 m123）；'
+        + '昵称、QQ 号、时间都不接受，填了不会引用（不会替你猜「那个人最近一条」）。'
         + '要回应图就 @ 发这张图的那个人——「谁发的图」和「谁把你叫醒」是两回事，别 @ 错。）';
       if (fromList.includes('视频抽帧拼图')) {
-        multiNote += '有人问「这个视频讲了什么」时只看视频抽帧那张，别把群友发的图当成视频内容。';
+        multiNote += '有人问「这个视频讲了什么」时只看视频抽帧那张，别把群友发的图当成视频内容。'
+          // 2026-11-02：她说「第 5 格那个鼓着腮帮子的，是我吧」——格号只有她看得到。
+          + '说视频内容时用时间（第几秒 / 开头 / 中间 / 快结尾）或直接说画面，'
+          + '**不要说「第几格」**：群友看的是视频，不是你看的这张抽帧图。';
       }
     }
     const videoDetail = videoNotes.length ? (String.fromCharCode(10) + videoNotes.join(String.fromCharCode(10))) : '';
@@ -4577,13 +4613,16 @@ async function main() {
 
   /** 执行模型给的动作：发送、发表情、收尾。 */
 
-  async function applyLiteActionsV2(key, st, actions) {
+  async function applyLiteActionsV2(key, st, actions, replyTargets = new Map()) {
     const report = { sent: 0, sticker: null, finish: null, errors: [] };
     const kind = key.startsWith('private:') ? 'private' : 'group';
     const id = Number(key.split(':')[1]);
     // 好感度：模型给了就用模型的，没给就用规则兜底；只增不减，封顶 100。
     try {
-      const wakeUser = String(st.lastWakeUserId ?? '').trim();
+      // 2026-11-02：优先用本轮冻结的唤醒者（poke 走的是这个人，不是最后发言者）。
+      // wakeActorId === undefined 表示这个调用还没接上（回退旧字段）；null 表示明确没有人类触发者。
+      const frozenActor = st.wakeActorId;
+      const wakeUser = String((frozenActor === undefined ? st.lastWakeUserId : frozenActor) ?? '').trim();
       if (wakeUser) {
         const rawDelta = Number(actions.liking);
         const modelDelta = Number.isFinite(rawDelta) && rawDelta >= 0 ? Math.min(2, Math.floor(rawDelta)) : null;
@@ -4619,7 +4658,7 @@ async function main() {
     }
     // ⓪.4 唱歌：曲库里找歌，整个文件当语音条发出去（不走 TTS）。
     // 2026-10-28 加：之前只有 voice（TTS 说话），群里让她唱歌，她用 voice 说「我只学了半首」，
-    // 被追问「语音不能发吗」只能答「得问某群友」——因为根本没有「唱」这个动作。
+    // 被追问「语音不能发吗」只能答「得问南禺」——因为根本没有「唱」这个动作。
     if (actions.sing !== undefined && actions.sing !== null && String(actions.sing).trim()) {
       const want = String(actions.sing).trim().slice(0, 40);
       try {
@@ -4699,40 +4738,32 @@ async function main() {
         const safe = msgs.map((m) => m.slice(0, maxChars)).filter((m) => !SENSITIVE_RE.test(m));
         if (safe.length) {
           const delays = computeGapsV2(safe, 'auto', 0, [], cfg.socialV2?.send ?? {});
-          // replyTo 也可能被写成昵称或 QQ 号 —— 模型看不到 recent 段的 messageId，
-          // 实测就把「要回谁」填成了 userId。这里统一解析：
-          // 先当 messageId 试，不行再按昵称/QQ 号找那个人最近的一条消息。
+          // 2026-11-02：lite 只认本轮展示过的消息编号（消息行开头的 [m123]）。
+          // 不再把昵称/QQ 号猜成「那个人最近的一条」——那样会引用到他后面发的另一条
+          // （实测：她看到 22:14 的游戏图，replyTo 填了发送人，引用落到他 22:17 发的另一张图）。
+          // 解析不到就不引用，宁可少一个引用，也不要引错。
           let replyTo;
+          let replyTarget = null;
           let rawReplyToText = '';
           if (actions.replyTo !== undefined && actions.replyTo !== null && String(actions.replyTo).trim() !== '') {
             const rawReplyTo = String(actions.replyTo).trim();
             rawReplyToText = rawReplyTo;
-            // 模型会直接把上下文的「昵称(QQ号)」整串照抄过来（实测填过
-            // 「某群友(1234567890)」，于是 replyTo 解析失败、该引用的没引用）。
-            // 所以先把它拆成昵称 / 号码两种写法各试一遍。
-            const cands = [rawReplyTo];
-            const m = rawReplyTo.match(/^(.*?)[（(]\s*(\d{5,12})\s*[）)]$/);
-            if (m) {
-              if (m[2]) cands.push(m[2].trim());
-              if (m[1] && m[1].trim()) cands.push(m[1].trim());
+            const ref = rawReplyTo.replace(/^\[(m[1-9]\d*)\]$/, '$1');
+            replyTarget = replyTargets.get(ref) || null;
+            // 兼容：模型可能直接抄真实 messageId（只在本轮映射里找，不猜昵称/QQ号）。
+            if (!replyTarget && /^-?[1-9]\d*$/.test(rawReplyTo)) {
+              replyTarget = [...replyTargets.values()].find((t) => String(t.messageId) === rawReplyTo) || null;
             }
-            for (const cand of cands) {
-              if (replyTo) break;
-              try {
-                const resolved = await resolveReplyTargetV2(st, kind, id, cand);
-                if (resolved) replyTo = resolved.messageId;
-              } catch {}
-            }
-            if (!replyTo) {
-              const pool = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
-              const hit = pool.filter((m) => cands.includes(String(m.userId ?? '')) || cands.includes(m.sender)).pop();
-              if (hit?.messageId) {
-                try {
-                  const resolved2 = await resolveReplyTargetV2(st, kind, id, String(hit.messageId));
-                  if (resolved2) replyTo = resolved2.messageId;
-                } catch {}
-              }
-              if (!replyTo) report.errors.push(`replyTo「${rawReplyTo}」解析不到对应消息，已改为不引用`);
+            if (replyTarget) {
+              // 2026-11-02（GPT review P2）：映射命中后仍要确认网关还能引用这条。
+              // 本地有映射、网关已拒绝时，reply 段会让第一条正文一起发不出去。
+              const mid = String(replyTarget.messageId);
+              let info = null;
+              try { info = await resolveReplyInfo(kind, id, mid); } catch {}
+              if (info) replyTo = mid;
+              else report.errors.push('引用目标「' + rawReplyTo + '」已不可用，已改为不引用');
+            } else {
+              report.errors.push('replyTo「' + rawReplyTo + '」不是本轮可引用的消息编号，已改为不引用（请填 m序号，勿填昵称/QQ号）');
             }
           }
           // at 允许填昵称或 QQ 号（模型更容易照抄昵称）。统一在这里解析成真实 QQ 号，
@@ -4747,14 +4778,14 @@ async function main() {
             else report.errors.push(`要 @ 的「${rawAt}」在最近消息里找不到对应 QQ 号，已跳过 @`);
           }
           // 一致性兜底（2026-10-26）：replyTo 指向 A、at 指向 B，而回复里根本没提 B ——
-          // 说明模型把「我引用的那条」和「我要 @ 的人」搞混了（实测：引用某群友的「菜呢」，
+          // 说明模型把「我引用的那条」和「我要 @ 的人」搞混了（实测：引用朵莉亚的「菜呢」，
           // 却 @ 了半小时前端白饭的「。」）。宁可不 @，也不 @ 错。
           if ((replyTo || rawReplyToText) && atUser && kind === 'group') {
             try {
               const pool0 = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
-              let rtMsg = replyTo
+              let rtMsg = replyTarget || (replyTo
                 ? pool0.find((m) => String(m.messageId) === String(replyTo))
-                : null;
+                : null);
               if (!rtMsg && rawReplyToText) {
                 // 引用解析失败（QQ 侧「消息不存在」）时，模型那句 replyTo 仍然表达了
                 // 「我想引谁」——按昵称 / QQ号 / 「昵称(号码)」三种写法回去找那个人，
@@ -4801,6 +4832,15 @@ async function main() {
           markPresenceV2(key, st, st.lastWakeUserId);
         }
       } catch (error) {
+        // 2026-11-02：sendMessagesV2 抛错时把已发出的几条放在 err.sent 里，
+        // 这里以前直接吞掉 —— 群里已经看到的话，她自己的上下文却没有，下一轮会重说一遍。
+        // 先把真实副作用记下来，再报错。
+        const partial = Array.isArray(error?.sent) ? error.sent : [];
+        if (partial.length) {
+          try { recordSentMessagesV2(key, partial); } catch { /* 登记失败不影响报错 */ }
+          report.sent = partial.length;
+          log('[lite] ' + key + ' 发送部分失败：已发出 ' + partial.length + ' 条，已登记进上下文；原因：' + (error?.message ?? error));
+        }
         report.errors.push(`发送失败：${error?.message ?? error}`);
       }
     }
@@ -5216,7 +5256,7 @@ async function main() {
     if (!lc.enabled) throw new Error('精简模式未开启');
     const st = getSocialV2State(key);
     // 2026-10-27：唤醒她的那条消息本身不带图时，只要这轮在聊「图」，就把最近 5 分钟内的图补上。
-    // 背景：22:36 群里连发两张图，22:37 某群友说「我加实图了」，唤醒来的是那句纯文字，
+    // 背景：22:36 群里连发两张图，22:37 南禺说「我加实图了」，唤醒来的是那句纯文字，
     // media 为空 → 图一张都没附，她只能回「加了图还是看不到嘛」。
     // 只在「这条消息确实在说图」时才补，避免每轮都塞旧图让她把旧图当新图。
     if (!Array.isArray(media) || media.length === 0) {
@@ -5228,7 +5268,13 @@ async function main() {
           .filter((m) => m && m.hasMedia && Array.isArray(m.media) && m.media.length
             && nowMs - Number(m.time || 0) < 5 * 60 * 1000)
           .slice(-2)
-          .flatMap((m) => m.media)
+          // 2026-11-02：补图分支也要带来源（发送人 + 消息 seq），否则这些图进入 ctx 时
+          // 没有可引用的来源编号，模型又只能猜。
+          .flatMap((m) => (m.media || []).map((md) => Object.assign({}, md, {
+            _fromName: String(m.sender || ''),
+            _fromUid: m.userId ? String(m.userId) : '',
+            _seq: Number.isSafeInteger(Number(m.seq)) ? Number(m.seq) : 0,
+          })))
           .slice(0, 2);
         if (picked.length) {
           media = picked;
@@ -5269,7 +5315,8 @@ async function main() {
         .map((m) => Number(m && m._seq))
         .filter((n) => Number.isSafeInteger(n) && n > 0)
     );
-    const userText = litePrompt.buildLiteUserMessage(key, reason, snapshot, research, sweep, mediaSeqs, fwd);
+    const replyTargets = new Map();
+    const userText = litePrompt.buildLiteUserMessage(key, reason, snapshot, research, sweep, mediaSeqs, fwd, replyTargets);
     const imageParts = Array.isArray(media) && media.length ? await resolveMediaList(media) : [];
     // 每张图对应的发送人，顺序跟 imageParts 一致（供 callLiteApi 写进提示词）
     const imgFrom = (Array.isArray(media) ? media : []).map((m) => ({
@@ -5298,9 +5345,51 @@ async function main() {
     } catch (error) {
       log('[video] 处理失败（不影响这轮回复）: ' + (error?.message ?? error));
     }
+    // 2026-11-02（GPT review P2）：附图清单只公布映射表里真实存在的编号。
+    // 在调用 API 前定稿：_replyRef 为空 = 这张图没有可引用的来源消息。
+    // 引用老图（B 引用了 A 的图）没有可靠的原消息编号，不能借用 B 的编号。
+    for (const p of (Array.isArray(imageParts) ? imageParts : [])) {
+      if (!p || p.type !== 'image') continue;
+      const seq = Number(p._seq);
+      const ref = Number.isSafeInteger(seq) && seq > 0 ? 'm' + seq : '';
+      p._replyRef = (!p._quoted && ref && replyTargets.has(ref)) ? ref : '';
+    }
     const started = Date.now();
     let result = await callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom);
+    // 2026-11-02：每发一次请求就记一笔。以前只有最后那一行记账，
+    // 降级重试 / 事实题兜底重试的调用费全漏了（重试一次就是一份钱）。
+    recordLiteUsage(key, result.usage, result.model, null);
     let actions = litePrompt.parseLiteActions(result.text);
+    // 2026-11-02：实测 20:42 群友问「月神几点几的卡池」，她回「月神是5.4，和玛薇卡一起」
+    // + 「这个我不用翻也知道」；20:44 问哥伦比亚，她又回「哥伦比亚是5.4，跟玛薇卡一起」
+    // —— 两轮 research 都是空的，ctx 里也没有 5.4/玛薇卡，纯编；而且**同一套答案换了个主语**。
+    // prompt 里那条「事实题先别急着凭印象答」没咬住，所以在这里加一道程序兜底：
+    // 报了数字却一次都没查过，就让她重来一次（二选一：去搜，或者说记不准）。
+    if (actions && !actions.__degraded && !research && !sweep) {
+      const said = (Array.isArray(actions.reply) ? actions.reply : [actions.reply])
+        .filter(Boolean).map(String).join(' ');
+      const claimedNumber = /\d+\s*[.．]\s*\d+/.test(said) || /\d+\s*月\s*\d+\s*(日|号)/.test(said);
+      // 只在「这一轮真的有人在问版本/期数/日期」时才管，否则她正常说个「1.5 倍」也会被拦下来重来
+      const askedVersion = /几点几|什么版本|哪个版本|第几期|哪一期|什么时候出|几号出|哪个池子|什么卡池/.test(String(userText || ''));
+      if (claimedNumber && askedVersion) {
+        log('[lite] ' + key + ' 报了数字但这一轮没查过（"' + said.slice(0, 40) + '"），让她重来一次');
+        const hardUser = userText + '\n\n【这一轮重来】你刚才直接报了一个版本号/日期，但你**并没有查过**。'
+          + '这一轮二选一：① 把要查的东西原样写进 research 字段，先搜、再根据结果回答；'
+          + '② 直接说「这个我真记不准」。**不许凭印象报数字，也不要把上一个问题的答案换个名字再用一遍。**';
+        try {
+          const retry = await callLiteApi(lc, systemPrompt, hardUser, imageParts, imgFrom);
+          recordLiteUsage(key, retry.usage, retry.model, null);
+          const retryActions = litePrompt.parseLiteActions(retry.text);
+          if (retryActions && !retryActions.__degraded) {
+            actions = retryActions;
+            result = retry;
+            log('[lite] ' + key + ' 重来拿到新动作');
+          }
+        } catch (guardError) {
+          log('[lite] ' + key + ' 重来失败（按原动作继续）: ' + (guardError?.message ?? guardError));
+        }
+      }
+    }
     // 降级重试（2026-10-26）：实测 18:25 那两轮连降级，28 秒内叫了两次「主人——」、
     // 还发了「（睡醒了，尾巴甩了一下）」这种括号动作 —— 全是降级时才有的。
     // 再要一次纯 JSON，只在降级时发生（今天约 24% 的轮次），一次 ¥0.001 量级。
@@ -5311,6 +5400,7 @@ async function main() {
           + '\n\n【必须按格式】你上一轮的输出不是 JSON 对象。这一轮**只输出一个 JSON 对象**，'
           + '不要解释、不要代码块、不要 JSON 以外的任何文字。字段照上面的说明填，没内容就省略。';
         const retry = await callLiteApi(lc, systemPrompt, retryUser, imageParts, imgFrom);
+        recordLiteUsage(key, retry.usage, retry.model, null);
         const retryActions = litePrompt.parseLiteActions(retry.text);
         if (retryActions && !retryActions.__degraded) {
           actions = retryActions;
@@ -5395,14 +5485,14 @@ async function main() {
       ? seenThrough
       : (Number.isSafeInteger(snapshot?.readThroughSeq) ? snapshot.readThroughSeq : null);
     if (st.__liteReadThrough !== null) st.lastActionAt = st.lastActionAt || Date.now();
-    const report = await applyLiteActionsV2(key, st, actions);
+    const report = await applyLiteActionsV2(key, st, actions, replyTargets);
     report.imgs = (Array.isArray(imageParts) ? imageParts : []).map((p) => { const r = mediaPartToBuffer(p); return { bytes: r ? r.buffer.length : 0, mime: r ? r.mimeType : '' }; });
     dumpLiteTurn(key, reason, userText, result.text, report);
     delete st.__liteReadThrough;
     report.ms = Date.now() - started;
     report.usage = result.usage;
-    // 花费必须落盘：lite 不走 DSH，token-usage.jsonl 不会有它的记录，不自己记就永远算不出成本。
-    recordLiteUsage(key, result.usage, result.model, report);
+    // 2026-11-02：这一行已由「每次 callLiteApi 之后记一笔」取代（见上面三处），
+    // 不然主调用会被记两次。这里只把 report 的统计补进这一轮日志。
     log(`[lite] ${key} 唤醒=${reason} 发出 ${report.sent} 条${report.sticker ? `，表情 ${report.sticker}` : ''}`
       + `，收尾=${report.finish ? JSON.stringify(report.finish) : '无'}`
       + `${report.errors.length ? `，问题：${report.errors.join('；')}` : ''}`
@@ -7401,10 +7491,20 @@ async function main() {
         includeReply: false
       });
       const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
+      // 2026-11-02：把原消息的**图片段**也带出来。以前这里只取文字（includeReply:false），
+      // 于是「引用一张老图问『你看到了没』」这个动作，桥接从头到尾没去拉那张图，
+      // 她只能回「那张我没取到」（实测 17:43，群友 17:15 发的图）。
+      let quotedMedia = [];
+      try {
+        quotedMedia = extractMediaFromSegments(raw.message ?? []);
+      } catch (mediaError) {
+        log('解析引用消息的图片失败: ' + (mediaError?.message ?? mediaError));
+      }
       const info = {
         sender: String(sender ?? ''),
         text: String(text ?? '').slice(0, 200),
-        userId: senderUserId != null ? String(senderUserId) : null
+        userId: senderUserId != null ? String(senderUserId) : null,
+        media: quotedMedia
       };
       replyInfoCache.set(cacheKey, { info, ts: Date.now() });
       return info;
@@ -7499,6 +7599,15 @@ async function main() {
       if (m?.raw) item.raw = sanitizeMediaSummary(m.raw, 200);
       if (m?.summary) item.summary = sanitizeMediaSummary(m.summary);
       if (m?.subType) item.subType = String(m.subType);
+      // 2026-11-02：引用图（B 引用了 A 的老图）要把原发送者带下来，否则
+      // collectWakeMediaV2 会按当前消息的 sender 覆盖成 B，模型就会说「B 发的图」
+      // 并 @ B（GPT review P1）。_quoted 只给提示词/来源判断用，不进 API。
+      if (m?._quoted) {
+        item._quoted = true;
+        item._sourceName = String(m._sourceName || m._fromName || '');
+        item._sourceUserId = String(m._sourceUserId || m._fromUid || '');
+        item._sourceMessageId = String(m._sourceMessageId || '');
+      }
       return item;
     }).filter((m) => (m.kind === 'face' ? !!m.faceId : !!(m.file || m.url || m.emojiId || m.raw))) : [];
     const safeForwardIds = (Array.isArray(forwardIds) ? forwardIds : []).map(sanitizeForwardId).filter(Boolean);
@@ -7932,7 +8041,7 @@ async function main() {
     // 理由：①新话题的提问者会 @ 或叫名字，atMention / nameMention 已经覆盖；
     // ②话题进行中的问句由在场窗口 shouldJoinConversationV2 的第②条接住。
     // 留着它只有一个实际效果——别人问别人的问题，只要话里带「你……怎么……」就把她叫醒。
-    // 当天 20:35 的实例：某群友问「你感觉你性格怎么样」其实是问蓝色神秘生物，
+    // 当天 20:35 的实例：刘森问「你感觉你性格怎么样」其实是问蓝色神秘生物，
     // 她被打醒后抢答「软呀 / 但急了会咬人」，而那条 @蓝色神秘生物 4 秒后才到。
     // 需要恢复时把 cfg.socialV2.wake.questionTrigger 设为 true。
     if (cfg.socialV2?.wake?.questionTrigger === true && tr.question && isDirectedAtAi(plainContent)) return 'question';
@@ -8046,7 +8155,7 @@ async function main() {
     // 修法：① 主动唤醒干脆不带图（没有新内容就别硬聊）；② 万不得已回退时，
     // 只保留已读水位之后的消息，绝不重复消费同一张图。
     // 2026-10-30 修：**已经给模型看过的图不再附第二遍**。
-    // 实测 19:32:35 那轮附了某群友的图（seq 3876）、收尾水位只到 3875，于是 19:33:00
+    // 实测 19:32:35 那轮附了陌颜的图（seq 3876）、收尾水位只到 3875，于是 19:33:00
     // 那轮又从 unread 里把同一张图取出来附了一次 —— 她对着同一张图说了两遍，
     // 第二次还自己补了句「这张图我看出来了」。上面那条「绝不重复消费同一张图」
     // 当时只在 recent 回退分支写了，unread 分支漏了；现在两条分支都按 modelSeenSeqs 过滤。
@@ -8078,11 +8187,16 @@ async function main() {
       for (const md of m.media) {
         if (!md || typeof md !== 'object') continue;
         // 挂上来源（2026-10-26）：以前只传图片本体，模型看到「1 张图 + 上下文里两条
-        // ［带图/表情］」根本分不清哪张是谁发的 —— 实测把某群友发的表情包当成主人发的，
+        // ［带图/表情］」根本分不清哪张是谁发的 —— 实测把朵莉亚发的表情包当成主人发的，
         // 还追问「主人这是冲谁呀」。_ 前缀的字段不会进 API，只给提示词用。
+        // 2026-11-02：引用图（md._quoted）按**原发送者**标，不按当前消息的 sender
+        // 覆盖成引用者（GPT review P1）。图仍然归属于当前这条消息（_seq 不变，
+        // 用于「图已附给你」和引用这条消息本身）。
+        const quotedFrom = md._quoted ? String(md._sourceName || '') : '';
         out.push(Object.assign({}, md, {
-          _fromName: String(m.sender || ''),
-          _fromUid: m.userId ? String(m.userId) : '',
+          _fromName: quotedFrom || String(m.sender || ''),
+          _fromUid: md._quoted ? String(md._sourceUserId || '') : (m.userId ? String(m.userId) : ''),
+          _quoted: !!md._quoted,
           _seq: Number.isSafeInteger(Number(m.seq)) ? Number(m.seq) : 0,
         }));
         if (out.length >= limit) return out;
@@ -8233,7 +8347,7 @@ async function main() {
     return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
-  async function sendWakePromptV2(key, reason) {
+  async function sendWakePromptV2(key, reason, actorId) {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -8247,7 +8361,7 @@ async function main() {
       if (!Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons = [];
       const seq = st.lastUnreadSeq || 0;
       if (!st.pendingWakeReasons.some((r) => r && r.reason === reason && r.seq === seq)) {
-        st.pendingWakeReasons.push({ reason, seq });
+        st.pendingWakeReasons.push({ reason, seq, actorId });
         // 有界队列：最多保留 20 条，防止消息洪峰下无限增长。
         if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
       }
@@ -8316,7 +8430,7 @@ async function main() {
             log(`[reserved2] 限频重试前发现未读已清空，跳过 ${key}（${reason}）`);
             return;
           }
-          void sendWakePromptV2(key, reason).catch((error) => log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error));
+          void sendWakePromptV2(key, reason, actorId).catch((error) => log(`[reserved2] 限频重试唤醒异常 ${key}:`, error?.message ?? error));
         }, waitMs);
         st.rateLimitRetryTimer.unref?.();
       }
@@ -8329,6 +8443,13 @@ async function main() {
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
     cancelReplyCheckV2(key); // 本次唤醒已接管，清理仍在排队的回复检查
+    // 2026-11-02：冻结本轮唤醒者。**必须放在判忙和限频之后** —— 前面那些分支都会 return
+    // （入队 / 放弃 / 延后重试），只有走到这里才说明这一轮真的要跑。
+    // 原来放在函数入口，会话忙的时候会先改掉 st.wakeActorId、再入队返回，
+    // 把**正在跑那一轮**的触发者覆盖掉（后果：好感度记给后触发的那个人）。
+    // undefined = 老调用没说明（下游回退旧字段）；null = 明确没有人类触发者。
+    if (actorId === undefined) delete st.wakeActorId;
+    else st.wakeActorId = actorId === null ? null : String(actorId);
     const wakeTime = now;
     st.wakeTimes.push(wakeTime);
     if (st.wakeTimes.length > 200) st.wakeTimes = st.wakeTimes.slice(-200);
@@ -8414,7 +8535,7 @@ async function main() {
     if (recentSelf.length >= 3) delay = Math.round(delay * 1.3);
     st.replyCheckTimer = setTimeout(() => {
       st.replyCheckTimer = null;
-      void sendWakePromptV2(key, 'replyCheck').catch((error) => log(`[reserved2] replyCheck 唤醒异常 ${key}:`, error?.message ?? error));
+      void sendWakePromptV2(key, 'replyCheck', null).catch((error) => log(`[reserved2] replyCheck 唤醒异常 ${key}:`, error?.message ?? error));
     }, delay);
     st.replyCheckTimer.unref?.();
     log(`[reserved2] 已安排回复检查唤醒 ${key}，${Math.round(delay / 1000)}s 后检查`);
@@ -8485,7 +8606,7 @@ async function main() {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
 
-  function scheduleWakeV2(key, reason) {
+  function scheduleWakeV2(key, reason, actorId) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -8498,6 +8619,8 @@ async function main() {
       const cur = st.pendingWakeReason || reason;
       if (wakePriorityV2(reason) > wakePriorityV2(cur)) {
         st.pendingWakeReason = reason;
+        // 2026-11-02：原因升级时唤醒者必须一起换，否则会出现「A 的原因配上 B 的人」
+        st.pendingWakeActorId = actorId;
         log(`[reserved2] 合并窗口内升级唤醒原因 ${key}: ${cur} -> ${reason}`);
       }
       return;
@@ -8506,7 +8629,7 @@ async function main() {
       if (!Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons = [];
       const seq = st.lastUnreadSeq || 0;
       if (!st.pendingWakeReasons.some((r) => r && r.reason === reason && r.seq === seq)) {
-        st.pendingWakeReasons.push({ reason, seq });
+        st.pendingWakeReasons.push({ reason, seq, actorId });
         // 有界队列：最多保留 20 条，防止消息洪峰下无限增长。
         if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
       }
@@ -8519,12 +8642,17 @@ async function main() {
       st.sleepTimer = null;
     }
     st.pendingWakeReason = reason;
+    st.pendingWakeActorId = actorId;
     const batchMs = Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
       const finalReason = st.pendingWakeReason || reason;
+      // 冻结到本轮的唤醒者：undefined 表示"老调用没说明"（下游回退旧字段），
+      // null 表示"这次不是某个人叫的"（定时/自主），字符串就是那个人的 QQ 号。
+      const finalActor = st.pendingWakeActorId;
       st.pendingWakeReason = null;
-      void sendWakePromptV2(key, finalReason).catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error));
+      st.pendingWakeActorId = undefined;
+      void sendWakePromptV2(key, finalReason, finalActor).catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error));
     }, batchMs);
     // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
     st.pendingWakeTimer.unref?.();
@@ -8558,14 +8686,14 @@ async function main() {
         log(`[reserved2] ${key} 繁忙期间的主动机会已过期，跳过补发`);
       } else {
         log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}`);
-        scheduleWakeV2(key, item.reason);
+        scheduleWakeV2(key, item.reason, item.actorId);
       }
       return { reason: item.reason, action: 'timer' };
     }
     const stillRelevant = Array.isArray(st.unread) && st.unread.some((m) => m && Number(m.seq) >= Number(item.seq));
     if (stillRelevant) {
       log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}@seq${item.seq}`);
-      scheduleWakeV2(key, item.reason);
+      scheduleWakeV2(key, item.reason, item.actorId);
       return { reason: item.reason, action: 'replayed' };
     }
     log(`[reserved2] ${key} 繁忙期间唤醒 ${item.reason}@seq${item.seq} 已被当前回合处理，跳过补发`);
@@ -8599,12 +8727,12 @@ async function main() {
         log(`[reserved2] ${key} 睡眠已过期 ${Math.round(overdueMs / 60000)} 分钟（中途重启过），重新计 ${Math.round(ms / 60000)} 分钟，不补唤醒`);
         st.sleepTimer = setTimeout(() => {
           st.sleepTimer = null;
-          void sendWakePromptV2(key, 'timeout').catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+          void sendWakePromptV2(key, 'timeout', null).catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
         }, ms);
         st.sleepTimer.unref?.();
         return;
       }
-      void sendWakePromptV2(key, 'timeout').catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+      void sendWakePromptV2(key, 'timeout', null).catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
       return;
     }
     // Node setTimeout 超过 2^31-1ms 会按 1ms 触发；远未来定时器先等一小段后重新续期，
@@ -8622,7 +8750,7 @@ async function main() {
     }
     st.sleepTimer = setTimeout(() => {
       st.sleepTimer = null;
-      void sendWakePromptV2(key, 'timeout').catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+      void sendWakePromptV2(key, 'timeout', null).catch((error) => log(`[reserved2] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
     }, delay);
     st.sleepTimer.unref?.();
     log(`[reserved2] 设置有限潜水定时器 ${key}，剩余 ${Math.round(delay / 1000)}s`);
@@ -8815,7 +8943,7 @@ async function main() {
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
       if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        void sendWakePromptV2(key, 'proactiveCheck', null).catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
     }, delay);
@@ -8875,8 +9003,39 @@ async function main() {
   }
 
   // QQ 消息 → DSH prompt
+  // ── 【本地私有 · 可选】手机转述通道 ──────────────────────────────────────
+  // 主体在 /root/qq-relay/relay.mjs，那个文件**不在本仓库树内**、也不随发布包走。
+  // 缺文件时这里 catch 住静默跳过，所以别人拿到仓库或发布包都不受影响。
+  // 暗号不是 `>` 开头时连模块都不加载，正常聊天零开销。
+  let relayModPromise = null;
+  async function relayTryHandleIncoming(kind, id, event, cfg) {
+    const text = (event?.message ?? [])
+      .filter((s) => s?.type === 'text')
+      .map((s) => s?.data?.text ?? '')
+      .join('');
+    if (!text.trimStart().startsWith('>')) return false;
+    try {
+      relayModPromise ??= import('file:///root/qq-relay/relay.mjs');
+      const relay = await relayModPromise;
+      return await relay.relayTryHandle({
+        kind,
+        userId: event?.user_id,
+        text,
+        ownerQQ: cfg?.ownerQQ,
+        // 转述的回复以 bot 身份发回原来的私聊
+        send: (t) => sendToQQ(convKey(kind, id), t)
+      });
+    } catch (error) {
+      relayModPromise = null;
+      log('relay 通道出错（已忽略）:', error?.message ?? error);
+      return false;
+    }
+  }
+
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
+    // 【本地私有 · 可选】手机转述通道：`> 内容` 转发到本机 DSH（见 /root/qq-relay/relay.mjs）
+    if (await relayTryHandleIncoming(kind, id, event, cfg)) return;
     // 管理员白名单命令必须放在白名单检查**之前**：
     // 群/私聊不在白名单时消息会被直接丢弃，命令也就永远收不到（鸡生蛋问题）。
     if (await handleAllowCommand(kind, id, event, cfg)) return;
@@ -8896,6 +9055,35 @@ async function main() {
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     let plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
+    // 2026-11-02：引用消息里如果带图，也一起拉进本轮。不这么做的话，
+    // 「引用一张老图问看到了没」她永远只能回「没取到」——引用解析只给了文字。
+    try {
+      const replySeg = (event.message ?? []).find((seg) => seg?.type === 'reply' && seg.data?.id != null);
+      const room = MAX_MEDIA_COUNT - mediaList.length;
+      if (replySeg && room > 0) {
+        const quoted = await resolveReplyInfo(kind, id, String(replySeg.data.id), event.self_id);
+        const extra = Array.isArray(quoted?.media) ? quoted.media.slice(0, room) : [];
+        if (extra.length) {
+          for (const m of extra) {
+            // 2026-11-02：保留原发送者，别让引用者（B）冒充图片来源。
+            // 只加 _fromName 是不够的 —— safeMedia 归一化会把它丢掉，之后
+            // collectWakeMediaV2 又按「当前消息的 sender」覆盖成 B（GPT review P1）。
+            mediaList.push({
+              ...m,
+              _fromName: String(quoted.sender || ''),
+              _fromUid: quoted.userId ? String(quoted.userId) : '',
+              _quoted: true,
+              _sourceName: String(quoted.sender || ''),
+              _sourceUserId: quoted.userId ? String(quoted.userId) : '',
+              _sourceMessageId: String(replySeg.data.id),
+            });
+          }
+          log(`[media] ${key} 引用消息里带了 ${extra.length} 张图，一起拉进来（原发送者 ${quoted.sender || '未知'}）`);
+        }
+      }
+    } catch (quoteMediaError) {
+      log('[media] 取引用消息的图失败: ' + (quoteMediaError?.message ?? quoteMediaError));
+    }
     logMediaProbe(key, mediaList);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
@@ -8962,7 +9150,7 @@ async function main() {
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     // 只有桥接自己的这几个命令才拦。别的以 / 开头的一律当聊天 ——
-    // 2026-10-26 实测：她教群友「@某官方机器人 /今日老婆」，群友照发，被这句
+    // 2026-10-26 实测：她教群友「@幻梦 /今日老婆」，群友照发，被这句
     // 「管理命令仅管理员可用」吃掉：她自己在教的东西，被自己的拦截器拦了。
     const KNOWN_ADMIN_CMD = /^\/(?:reset|new|status|role|人格|silent|quiet|active|speak)(?:\s|$)/;
     if (plainContent.startsWith('/') && KNOWN_ADMIN_CMD.test(plainContent)) {
@@ -9085,11 +9273,11 @@ async function main() {
       if (!st.bootstrapSent) {
         st.bootstrapSent = true;
         saveSocialV2State();
-        scheduleWakeV2(key, 'bootstrap');
+        scheduleWakeV2(key, 'bootstrap', event.user_id != null ? String(event.user_id) : null);
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
         if (reason) {
-          scheduleWakeV2(key, reason);
+          scheduleWakeV2(key, reason, event.user_id != null ? String(event.user_id) : null);
         }
       }
       appendActivity(`${key} [reserved2] 消息已入未读 [${sender}(${event.user_id ?? ''})]：${textContent.slice(0, 80)}`);
@@ -9387,14 +9575,17 @@ async function main() {
     if (!st.bootstrapSent) {
       st.bootstrapSent = true;
       saveSocialV2State();
-      scheduleWakeV2(key, 'bootstrap');
+      scheduleWakeV2(key, 'bootstrap', senderId || null);
     } else if (st.wakeConfig?.triggers?.poke) {
       // 2026-10-27 修复：群里「A 拍 B」同样会推 poke 事件。以前这里只看 triggers.poke，
       // 不判断 target_id，于是任何一次拍别人都会把她叫醒，prompt 里还写成「X 拍了你一下」——
-      // 表现为「某群友拍蓝色神秘生物 → 她当成拍自己 → 连问『那你拍的是谁呀』」。
+      // 表现为「刘森拍蓝色神秘生物 → 她当成拍自己 → 连问『那你拍的是谁呀』」。
       // 有 target_id 就严格比对；老运行时可能不传 target_id，那种情况才保守放行（宁可多醒一次）。
       if (targetIsSelf || !targetId) {
-        scheduleWakeV2(key, 'poke');
+        // 2026-11-02：把"是谁拍的"显式带进唤醒上下文。以前这里不带，
+        // prompt 就沿用 st.lastWakeUserId（最后发消息的人），于是拍了别人/被群友拍，
+        // 都会写成「主人拍了你一下」，她还会顺着去 @ 主人。
+        scheduleWakeV2(key, 'poke', senderId || null);
       } else {
         appendActivity(key + ' 拍一拍没拍我（' + sender + ' -> ' + targetId + '），不唤醒');
       }

@@ -70,7 +70,7 @@ export function createLitePrompt(deps) {
   }
 
   /** 拼本轮的用户消息：群里最近的消息 + 本次唤醒的快照。 */
-  function buildLiteUserMessage(key, reason, snapshot, research = null, sweep = null, attachedSeqs = null, fwd = null) {
+  function buildLiteUserMessage(key, reason, snapshot, research = null, sweep = null, attachedSeqs = null, fwd = null, replyTargets = null) {
     const lc = liteConfig();
     const st = getSocialV2State(key);
     const parts = [];
@@ -108,12 +108,13 @@ export function createLitePrompt(deps) {
         ? '【你和 TA 的私聊】（旧 → 新；括号里是 QQ 号，「你」是你自己）'
         : '【群里最近的消息】（旧 → 新；括号里是 QQ 号，「你」是你自己）';
       parts.push(thread.active
-        ? headLine.slice(0, -1) + `。**这个话题从 ${thread.startTime} 起已经聊了 ${thread.count} 条**。开头标「〔早先〕」的是几小时前的旧消息，只帮你回忆起这个话题是怎么起头的，**不要回头去回它们**；「……略」是中间跳过的部分）`
+        ? headLine.slice(0, -1) + '。开头标「〔早先〕」的是较早的背景消息，只帮你回忆话题怎么起头的，**不证明这一轮那张图或那句话是什么**，也不要回头去回它们；「……略」是中间跳过的部分）'
         : headLine);
       for (const m of list) {
-        // 中间被省略的那一段：明说省略多少条，免得她以为中间没人说话
+        // 中间略去的部分只标用途，不把消息计数混进聊天上下文（2026-11-02：她曾把
+        // 「42 分钟前」读成图片里的「剩 42 轮」）。
         if (m && m.__gap) {
-          parts.push(`（……中间 ${m.__gap} 条略，还是同一件事的来回……）`);
+          parts.push('（……中间部分略，还是同一件事的来回……）');
           continue;
         }
         // 别人的消息必须带 QQ 号：模型要 @ 人只有这一个可靠依据，
@@ -142,15 +143,24 @@ export function createLitePrompt(deps) {
         const rel = m.quoteTargetIsSelf ? ' →回你' : '';
         // 带图的两条消息连着出现时，她分不清图是谁的（2026-10-26 实测）。这里明写
         // 「这张图附给你了没有」——没附的那条她看不到内容，就不该猜。
+        // 2026-11-02：真实附图清单以文末「实际附图清单」为准（候选 ≠ 已送达），
+        // 这样「消息行说附了、请求里其实没带」不会再骗她。
         let imgTag = '';
         if (m.hasMedia) {
           const mine = attachedSeqs && Number.isSafeInteger(Number(m.seq)) && attachedSeqs.has(Number(m.seq));
-          imgTag = mine ? '［图已附给你］' : '［图没附给你，你看不到这条的图］';
+          imgTag = mine ? '［候选附图，以文末实际附图清单为准］' : '［图没附给你，你看不到这条的图］';
         }
         // 捞回来的旧消息要和「现在正聊的」区分开（2026-10-26）：实测她会把两小时前的
         // 「我给你兜底」当成待回应的事，隔一会儿又问一遍「那个兜底还算不算数」。
         const oldTag = m && m.__old ? '〔早先〕' : '';
-        parts.push(`${oldTag}${ts}${ownerTag}${who}：${text}${imgTag}${rel}${isNew ? '  ← 刚到的' : ''}`);
+        // 可引用编号（2026-11-02）：只给本轮实际展示、且有真实 messageId 的消息编号，
+        // 模型 replyTo 照抄这个，引用就落在它真正看到的那条上，不会落到「某人最近一条」。
+        const replyRef = Number.isSafeInteger(Number(m.seq)) && Number(m.seq) > 0
+          && /^-?[1-9]\d*$/.test(String(m.messageId ?? '')) ? 'm' + Number(m.seq) : '';
+        if (replyRef && replyTargets) {
+          replyTargets.set(replyRef, { messageId: String(m.messageId), userId: m.userId, sender: m.sender });
+        }
+        parts.push(`${replyRef ? '[' + replyRef + '] ' : ''}${oldTag}${ts}${ownerTag}${who}：${text}${imgTag}${rel}${isNew ? '  ← 刚到的' : ''}`);
       }
       if (freshSeqs.size) {
         parts.push('');
@@ -169,7 +179,11 @@ export function createLitePrompt(deps) {
       if (hh >= 23 || hh < 6) parts.push('（这么晚还在群里，可以催一句早点睡，但不用每次都说）');
       else if (hh < 9) parts.push('（早上，语气可以轻快一点）');
     } catch {}
-    const wakeUser = String(st.lastWakeUserId ?? '').trim();
+    // 2026-11-02：以前这里读 lastWakeUserId（只有普通群消息会更新），
+    // 于是「群友 A 拍了 bot → bot 被写成『主人拍了你』→ 她 @ 主人」。
+    // 现在读本轮冻结的唤醒者：undefined = 调用方还没接上（回退旧字段），null = 没有人类触发者。
+    const frozenActor = st.wakeActorId;
+    const wakeUser = String((frozenActor === undefined ? st.lastWakeUserId : frozenActor) ?? '').trim();
     if (wakeUser) {
       parts.push(describeLiking(likingData(), wakeUser, nicknameOf(key, wakeUser)));
       parts.push('');
@@ -332,7 +346,7 @@ export function createLitePrompt(deps) {
 
   // ── 上下文标记泄漏（2026-10-22 主人在群里当场看到两条） ────────────────
   // 她有时候把「【主人】」「昵称(QQ号)：」「你：」这些**上下文的格式**当成发言内容发出去，
-  // 群里变成「【主人】原来是10月啊」「【主人】{{OWNER_NAME}}(1234567890)：「这人最精了」」。
+  // 群里变成「【主人】原来是10月啊」「【主人】_M陌离S_(1234567890)：「这人最精了」」。
   // 那是我们喂给她的排版，不是她该说的话 —— 发出去前统一剥掉。
   function cleanLiteReplyText(text, st) {
     let s = String(text ?? '').trim();
@@ -345,6 +359,7 @@ export function createLitePrompt(deps) {
     }
     for (let round = 0; round < 3; round += 1) {
       const prev = s;
+      s = s.replace(/^\[m[1-9]\d*\]\s*/, '');                                  // [m123]（2026-11-02：新加的消息编号，别让她抄进正文）
       s = s.replace(/^【[^】]{1,24}】\s*/, '');                                 // 【主人】【戳戳旁边打盹的鲸尾】
       s = s.replace(/^[^\s：:（）()「」]{1,20}[（(]\d{5,12}[）)]\s*[：:]\s*/, ''); // 昵称(123456)：
       s = s.replace(/^你\s*[：:]\s*/, '');                                     // 你：

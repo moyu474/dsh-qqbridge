@@ -375,14 +375,18 @@ export function createVideoModule({ stateDir, log = console.log }) {
       }
       const transcriptBlock = transcript.length
         ? '\n台词（按时间码，**没有说话人标记**：引用时只说「视频里有人说」，不许指名说谁说的）：\n'
-          + transcript.map((s) => '[第' + s.cell + '格 ' + clock(s.from) + '] ' + s.text).join('\n')
+          + transcript.map((s) => '[' + clock(s.from) + '] ' + s.text).join('\n')
         : '';
       log('[video] 抽帧完成（' + via + '，' + Math.round(size / 1024) + 'KB → ' + Math.round(buffer.length / 1024) + 'KB，' + cellMarks + '，台词 ' + transcript.length + ' 段）');
       return {
         buffer,
         mimeType: 'image/jpeg',
-        note: '视频联系表（总时长 ' + Math.round(duration || 0) + ' 秒）：' + cellMarks
-          + '。每格是该时刻的画面，要引用某一段就说第几格。'
+        note: '视频抽帧图（总时长 ' + Math.round(duration || 0) + ' 秒）：' + cellMarks
+          + '。每格标着它对应的**视频时间点**。'
+          // 2026-11-02：原来这里写的是「要引用某一段就说第几格」，她照着说了「第 5 格那个鼓着
+          // 腮帮子的」——而这张拼图只有她能拿到，群友看的是一整个视频，根本不知道有格子。
+          + '对外说话一律用时间（「视频第 12 秒那里」「后面快结尾的时候」）或者直接说画面里有什么，'
+          + '**不要说"第几格"/"这张拼图"/"联系表"**——这些只有你看得到，群友看不到。'
           + (videoTitle ? '｜视频标题：' + videoTitle.slice(0, 60) : '')
           + transcriptBlock
       };
