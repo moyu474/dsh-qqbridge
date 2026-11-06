@@ -21,6 +21,7 @@ import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } fr
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { recallColdStorage, triggerWantsRecall } from './lite-recall.mjs';
 import { detectThread } from './lite-thread.mjs';
+import { readRecentCard, readDailySummary, refreshRecentCard, refreshTodaySupplement, getRecentContext, buildDailySummary } from './lite-recency.mjs';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
@@ -32,6 +33,10 @@ import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardR
 import { resolvePriceTable, priceUsage } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { createLitePrompt } from './lite-prompt.js';
+import { createImageLibrary } from './image-library.mjs';
+import { createImageTagger } from './image-tagger.mjs';
+import { createImageHistory, validateImageReplies } from './lite-vision.mjs';
+const liteImageHistory = createImageHistory();
 import { createConsoleServer } from './console-server.js';
 import { synthesizeMiniMax, countTtsChars, ttsCostCny } from './tts.js';
 import { bigrams, makeRecord, searchKnowledge, mergeRecords, formatKnowledge } from './web-knowledge.js';
@@ -1271,7 +1276,7 @@ async function segmentsToText(segments, options = {}) {
       // 字面量 `[markdown]` 被喂给模型。SDK 的 KnownMessageSegment 联合里没有 markdown，
       // 所以段类型是运行时多出来的 —— 这正是 default 分支原来会命中的情况。
       case 'markdown': {
-        // QQ 官方机器人（幻梦这类「今日老婆」卡片）用 markdown 段发消息，图片写成
+        // QQ 官方机器人（这类「今日老婆」卡片）用 markdown 段发消息，图片写成
         // ![#70px #124px](https://qqbot.ugcimg.cn/...)。原来整段当文本塞进上下文，模型
         // 只看到一串 URL 源码，图永远到不了眼前（2026-10-27 实测：她只能靠猜）。
         // 图片本体由 extractMediaFromSegments 的 markdown 分支提取，这里只把文本洗干净。
@@ -1489,6 +1494,13 @@ async function main() {
     stickerStoreWritable = false;
     log(`⚠️ 表情库读取失败，已降级为「只读不写」（不会覆盖原文件）：${error?.message ?? error}`);
   }
+  const imageLibrary = createImageLibrary({ stateDir: STATE_DIR, cfg, getStickers: () => stickerEntries, log });
+  const imageTagger = createImageTagger({ library: imageLibrary, stateDir: STATE_DIR, cfg, log,
+    fetchImage: async (entry) => entry.kind === 'image'
+      ? { buffer: await fs.promises.readFile(imageLibrary.imagePath(entry)), mimeType: entry.mimeType }
+      : safeFetchBuffer(entry.url, MAX_MEDIA_BYTES),
+  });
+  if (imageLibrary.limits.enabled) imageTagger.enqueuePending();
   let stickerSyncedAt = 0; // 上次从 SnowLuma 拉取收藏表情的时间戳（毫秒）
   let lastForcedAgentStickerSync = 0; // AI 强制刷新表情库的最小间隔保护
 
@@ -2004,7 +2016,7 @@ async function main() {
       const record = segments.find((s) => s?.type === 'record');
       if (!record) return null;
       // 注意：只回报「确认成功 + 时长」，**不回传 file/url**。
-      // 私聊消息里 get_msg 会把源文件路径塞进 url（如 D:\...\audio\xxx.mp3），
+      // 私聊消息里 get_msg 会把源文件路径塞进 url（如 <盘符>:\...\audio\xxx.mp3），
       // 回给 AI 就等于把本机路径写进模型上下文（也会被敏感信息审计拦）。
       return {
         confirmed: true,
@@ -2064,11 +2076,11 @@ async function main() {
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
-    const synced = await syncStickerLibrary(true);
-    const entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
+    const synced = options.material ? null : await syncStickerLibrary(true);
+    const entry = options.material || findSticker(synced?.entries ?? stickerEntries, stickerRef);
     if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id`);
     const url = entry.url;
-    if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
+    if (entry.kind !== 'image' && !url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const [kind, id] = key.split(':');
     const segments = [];
     const replyToMessageId = options.replyToMessageId;
@@ -2088,7 +2100,7 @@ async function main() {
     // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重新抓取。
     let image;
     try {
-      image = await safeFetchBuffer(url, MAX_MEDIA_BYTES);
+      image = entry.kind === 'image' ? { buffer: await fs.promises.readFile(imageLibrary.imagePath(entry)) } : await safeFetchBuffer(url, MAX_MEDIA_BYTES);
     } catch (error) {
       throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
     }
@@ -2129,6 +2141,10 @@ async function main() {
     });
     const data = await sendResult;
     // 更新本地使用统计
+    if (options.material) {
+      try { imageLibrary.markUsed(entry, options.context || 'sticker'); } catch (error) { log('[pic] 使用统计写入失败: ' + error.message); }
+      return { entry, messageId: data?.message_id ?? null };
+    }
     const updated = markStickerUsed(stickerEntries, entry.id, 'sticker');
     stickerEntries = updated.entries;
     saveStickerStoreSafe();
@@ -4013,10 +4029,11 @@ async function main() {
     // 只有 file 是安全缓存文件名时才允许交给网关（防任意路径/内网 URL 注入）。
     const tryGetImage = async () => {
       if (!(media.kind === 'image' || media.kind === 'sticker')) return null;
-      if (!media.file || !isProbablySafeImageFileRef(media.file)) return null;
+      if (!media.file || !isProbablySafeImageFileRef(media.file)) { failures.push('get_image: missing or unsafe file reference'); return null; }
       try {
         const info = await bot.getImage({ file: String(media.file) });
-        const obj = info && typeof info === 'object' ? info : {};
+        if (info?.status === 'failed' || (info?.retcode != null && Number(info.retcode) !== 0)) failures.push(`get_image status=${info.status || ''} retcode=${info.retcode ?? ''}: ${info.message || info.wording || 'gateway failure'}`);
+        const obj = info && typeof info === 'object' && info.data && typeof info.data === 'object' && !Buffer.isBuffer(info.data) ? info.data : (info && typeof info === 'object' ? info : {});
         const base64 = base64FromMaybe(obj.data) || base64FromMaybe(obj.base64) || base64FromMaybe(obj.file);
         if (base64) {
           // 粗略估计 base64 解码后大小，超限直接拒绝，避免超大字符串撑爆内存
@@ -4027,15 +4044,18 @@ async function main() {
             log(`get_image 返回的图片 base64 超限，已跳过（${Math.round(base64.length * 3 / 4 / 1024)}KB）`);
           }
         }
+        if (base64) failures.push('get_image: invalid or oversized base64');
         if (obj.url) {
           try {
             const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES);
             const accepted = acceptImageBuffer(fetched.buffer, 'get_image URL 图片');
             if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(obj.url) };
+            failures.push('get_image url: invalid image');
           } catch (error) {
             failures.push(`get_image url: ${error?.message ?? error}`);
           }
         }
+        if (typeof obj.file === 'string' && !obj.file.startsWith('base64://') && (!fs.existsSync(obj.file) || !isSafeLocalMediaPath(obj.file))) failures.push('get_image: local file missing or outside allowed path');
         if (typeof obj.file === 'string' && !obj.file.startsWith('base64://') && fs.existsSync(obj.file) && isSafeLocalMediaPath(obj.file)) {
           const stat = fs.statSync(obj.file);
           if (stat.size > MAX_MEDIA_BYTES) {
@@ -4048,6 +4068,7 @@ async function main() {
       } catch (error) {
         failures.push(`get_image: ${error?.message ?? error}`);
       }
+      failures.push('get_image: no usable image data');
       return null;
     };
 
@@ -4058,9 +4079,7 @@ async function main() {
       mediaMemPut(cacheKey, result);
       return result;
     }
-    if (failures.length) {
-      log(`[media] ${label}获取失败（${failures.length} 次尝试）：${failures.slice(0, 3).join(' | ')}`);
-    }
+    log(`[media] image fetch failed seq=${media._seq || 'unknown'} kind=${media.kind || 'unknown'} subType=${media.subType || ''} file=${String(media.file || '').slice(0, 100)}: ${failures.join(' | ') || 'no usable source'}`);
     return null;
   }
 
@@ -4110,7 +4129,7 @@ async function main() {
           }
           totalBytes += face.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`, _from: String(media._fromName || ''), _seq: media._seq, _quoted: !!media._quoted });
+          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`, _from: String(media._fromName || ''), _fromUid: String(media._fromUid || ''), _seq: media._seq, _quoted: !!media._quoted });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
@@ -4126,7 +4145,7 @@ async function main() {
           }
           totalBytes += img.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`, _from: String(media._fromName || ''), _seq: media._seq, _quoted: !!media._quoted });
+          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`, _from: String(media._fromName || ''), _fromUid: String(media._fromUid || ''), _seq: media._seq, _quoted: !!media._quoted });
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -4333,12 +4352,12 @@ async function main() {
 - 不想说话就省略 reply（可以只带 markThrough / wake）。
 - **at 什么时候用**：这话是回某个人的 —— 尤其是他隔了几条才问、或者群里同时有好几件事在聊 —— 就 @ 他一下，不然别人不知道你在回谁。紧接着上一句连续聊的时候不用 @，每条都 @ 像客服。一条最多 @ 一个人，填括号里的 QQ 号照抄。
 - **@ 的人要跟内容对得上**：你说的是谁的图、谁说的话，就 @ 谁，别因为那是最后一条消息就 @ 最后说话的人。拿不准就不填 at。
-- **分清「谁说的」和「说的谁」**：两条消息挨着来，不等于说的是同一件事。A 说「能玩鬼泣123，不玩3a就没问题」，B 接一句「已经饿到这种程度了吗」——B 是在吐槽 A 选的那台机器，不是 B 发了什么东西。别把 B 的感叹安成「B 发的图」（2026-10-31 实测就答成了「南禺你饿成这样了才发这个吧」，可图是芬恩发的）。
+- **分清「谁说的」和「说的谁」**：两条消息挨着来，不等于说的是同一件事。A 说「能玩鬼泣123，不玩3a就没问题」，B 接一句「已经饿到这种程度了吗」——B 是在吐槽 A 选的那台机器，不是 B 发了什么东西。别把 B 的感叹安成「B 发的图」（2026-10-31 实测就答成了「群友甲你饿成这样了才发这个吧」，可图是群友乙发的）。
 - **说「你发的」之前先看那条消息前面是谁的名字**：图是哪个人发的，就只能说那个人发；名字不同就别把两件事粘在一起。拿不准就别提「谁发的」，直接说图里是什么。
-- **引用图片时**：从文末「实际附图清单」找到那张图的来源消息编号，replyTo 填该编号；不能拿发送者最近发的另一条代替（2026-11-02 实测：她看到 22:14 的游戏图，replyTo 填了发送人，结果引用落到他 22:17 发的另一张图上）。时间、条数、水位、消息编号都是元信息，不是图中文字或游戏数值；图里的数字看不清就别猜。
+- **引用图片时**：从文末「实际附图清单」找到那张图的来源消息编号，replyTo 填该编号；不能拿发送者最近发的另一条代替（2026-11-02 实测：她看到 22:14 的游戏图，replyTo 填了「群友乙」，结果引用落到他 22:17 发的猫图上）。时间、条数、水位、消息编号都是元信息，不是图中文字或游戏数值；图里的数字看不清就别猜。
 - **replyTo 和 at 必须是同一件事**：你引用了谁的话，at 就该是他；反过来也一样。引 A 说的「菜呢」却 @ B，群里看着就是乱的。真要在一句里点别人，就把「@昵称 内容」写进 reply 里，别改 at 字段。
 - **一轮里要 @ 两个人怎么办**：at 字段只能填一个。另一个人的 @ 直接写进那条 reply 里，格式「@昵称 内容」或「@QQ号 内容」，桥接会自动解析成真 @。例：第一条回 A 的问题，第三条想接 B 发的图，就写成「@B 这图…」这样。
-- sticker：想发表情就填一个标签，会单独成一条发出去，跟你说话不冲突，可以同一轮又要说话又发表情。常用场景：无语、得意、委屈、想撒娇、被怼到了。不必每轮都发，五六轮一张就差不多；标签只能从下面这张表里挑，挑不到就不填。
+- sticker：想发张图/表情就填一个标签，会单独成一条发出去，跟你说话不冲突，可以同一轮又要说话又发图。标签**只能照抄**下面那张表里的词，一个字都别改；表里没有你想表达的那个意思，就**不要填这个字段**，自己造词（比如「无语」「委屈」）这轮白填，还会记一条失败日志。不必每轮都发，五六轮一张就差不多。
 - **poke 什么时候用**：拍一拍是「不说话也能碰你一下」的动作 —— 他没回你、你想提醒他、撒娇要 Attention、他说的东西让你想拍他。填**他消息里括号中的 QQ 号**（照抄，别编）；拍完不用在 reply 里解释。**十分钟最多一次**，别每条都附一个拍，那是骚扰不是撒娇。
 - **换个花样**：同一个词别连着好几轮都用。「就这？」「配你个头」「你配吗」这种用一次就够，第二轮还用它就像卡带了。
 - **同一张图别反复点评**：上一轮已经说过「这熊猫好憨」，这一轮就换个说法或者直接不接；连着两轮用几乎一样的句子描述同一张图，看着像卡住了（2026-10-26 实测，同一张熊猫图说了两遍「表情好憨」）。
@@ -4427,10 +4446,11 @@ async function main() {
 
   const litePrompt = createLitePrompt({
     cfg, STATE_DIR, log,
-    getSocialV2State, getStickerEntries: () => stickerEntries,
+    getSocialV2State, getStickerEntries: () => imageLibrary.view(),
     nicknameOf,
     describeLiking, detectThread,
     recallColdStorage, triggerWantsRecall,
+    getRecentContext,
     currentRoleHintV2, songsHint, ttsCfg,
     likingData, LITE_SYSTEM_TEMPLATE, ROLE_MAX_CHARS,
   });
@@ -4475,35 +4495,45 @@ async function main() {
       : mt.includes('webp') ? 'image/webp' : 'image/jpeg';
     if (buf.length <= 900 * 1024 && kind !== 'image/gif') return { buffer: buf, mimeType: kind };
     const ext = kind === 'image/png' ? 'png' : kind === 'image/gif' ? 'gif' : kind === 'image/webp' ? 'webp' : 'jpg';
+    // Decode only the first GIF frame to bound convert output.
+    const input = ext + ':-' + (kind === 'image/gif' ? '[0]' : '');
+    const validOutput = (out) => {
+      if (!out || !out.length || out.length > 4 * 1024 * 1024 || mimeFromBuffer(out) !== 'image/jpeg') return false;
+      const dims = getImageDimensions(out);
+      return !!dims && dims.width > 0 && dims.height > 0 && dims.width <= 1568 && dims.height <= 1568;
+    };
     try {
-      const out = execFileSync('convert', [ext + ':-', '-resize', '1568x1568>', '-quality', '92', 'jpg:-'],
-        { input: buf, maxBuffer: 12 * 1024 * 1024, timeout: 20000 });
-      if (out && out.length) return { buffer: out, mimeType: 'image/jpeg' };
-    } catch (error) {
-      log('[lite] 图片压缩失败，退回原图：' + (error?.message ?? error));
+      const out = execFileSync('convert', [input, '-resize', '1568x1568>', '-quality', '92', 'jpg:-'],
+        { input: buf, maxBuffer: 24 * 1024 * 1024, timeout: 20000, stdio: ['pipe', 'pipe', 'ignore'] });
+      if (validOutput(out)) return { buffer: out, mimeType: 'image/jpeg' };
+    } catch (error) { log('[lite] image compression failed: ' + (error?.message ?? error)); }
+    let dir, fd;
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qqbridge-vision-'));
+      const file = path.join(dir, 'out.jpg');
+      fd = fs.openSync(file, 'w+', 0o600);
+      execFileSync('convert', [input, '-resize', '1024x1024>', '-quality', '78', 'jpg:-'],
+        { input: buf, timeout: 20000, stdio: ['pipe', fd, 'ignore'] });
+      const stat = fs.fstatSync(fd);
+      if (stat.size > 0 && stat.size <= 4 * 1024 * 1024) {
+        const out = fs.readFileSync(file);
+        if (validOutput(out)) return { buffer: out, mimeType: 'image/jpeg' };
+      }
+      log('[lite] image compression retry produced invalid or oversized output');
+    } catch (error) { log('[lite] image compression retry failed: ' + (error?.message ?? error)); }
+    finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+      if (dir) {
+        try { fs.unlinkSync(path.join(dir, 'out.jpg')); } catch {}
+        try { fs.rmdirSync(dir); } catch {}
+      }
     }
-    return { buffer: buf, mimeType: kind };
+    return kind !== 'image/gif' && buf.length <= 900 * 1024 ? { buffer: buf, mimeType: kind } : null;
   }
 
-  /** 调一次 DeepSeek chat/completions，返回正文文本。 */
-  async function callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom = []) {
-    if (!lc.apiKey) throw new Error('精简模式缺少 API key（config.socialV2.lite.apiKey 或环境变量 DEEPSEEK_API_KEY）');
-    // DeepSeek 的 chat/completions 其实支持 image_url（2026-10-22 实测 deepseek-chat
-    // 能正确描述图片内容）。以前「带图就 400」的真因是原图没压、请求体好几 MB 撞了
-    // 大小限制，不是不支持视觉 —— 所以压缩后再传，真的让她看见图。
-    const visionParts = [];
-    // 来源必须跟 visionParts **一起收集**（2026-10-26 修）。
-    // 原来 imgFrom 是按 media 全量建的、visionParts 是「能解码的才收」，
-    // 中间只要有一张空图（0 字节），两边索引就错位 ——
-    // 实测 21:21 那轮 5 张里 2 张能解码，提示词把「视频抽帧图」的下一张说成了别人发的。
-    const fromList = [];
-    // 2026-11-02：可引用来源编号（_replyRef）跟 visionParts 一起收集。
-    // 引用图片时要让模型能指回「这张图所在的那条消息」，不能只给发送人。
-    // 只收集映射表里真实存在的编号（deliverLiteV2 定稿时写入 _replyRef）。
-    const seqList = [];
-    // 视频联系表的说明（每格第几秒 / 台词）由 videoToSheet 的 note 带过来。
-    // 2026-10-28 之前这里只把图塞进去、note 直接丢了，时间码和台词全没送到她眼前。
-    const videoNotes = [];
+  /** 准备最终发送的图片集合。 */
+  function prepareLiteImages(imageParts) {
+    const selected = [];
     let imgBudget = 6 * 1024 * 1024; // base64 总长上限（1568/q92 的截屏一张 300~800KB，三张也放得下）
     // 2026-11-02：原来这里是 slice(0, 3) —— 一轮超过 3 张图就静默丢掉，日志里看不出来。
     // 群友一次连发四五张很常见，她会当成"只看得到前三张"去回答。上限提到 6，
@@ -4519,33 +4549,42 @@ async function main() {
     // 「消息行说附了 3 张、请求里其实只带 2 张」就是这么来的。
     for (const p of (Array.isArray(imageParts) ? imageParts : []).filter((p) => p && p.type === 'image').slice(0, MAX_VISION_IMAGES)) {
       const raw = mediaPartToBuffer(p);
-      if (!raw || !raw.buffer || !raw.buffer.length) continue;
+      if (!raw || !raw.buffer || !raw.buffer.length) { log(`[lite] image skipped seq=${p._seq || 'unknown'}: no decodable data`); continue; }
       const small = shrinkImageForVision(raw.buffer, raw.mimeType);
-      if (!small || !small.buffer || !small.buffer.length) continue;
+      if (!small || !small.buffer || !small.buffer.length) { log(`[lite] image skipped seq=${p._seq || 'unknown'}: compression failed or output too large`); continue; }
       const b64 = small.buffer.toString('base64');
-      if (b64.length > imgBudget) continue;
+      if (b64.length > imgBudget) { log(`[lite] image skipped seq=${p._seq || 'unknown'}: vision budget exceeded`); continue; }
       imgBudget -= b64.length;
-      visionParts.push({ type: 'image_url', image_url: { url: 'data:' + small.mimeType + ';base64,' + b64 } });
-      fromList.push(String((p && (p._from || p._fromLabel)) || ''));
-      seqList.push(String((p && p._replyRef) || ''));
-      if (p && p._videoNote) videoNotes.push(String(p._videoNote));
+      selected.push({ source: p, hash: crypto.createHash('sha256').update(raw.buffer).digest('hex'), vision: { type: 'image_url', image_url: { url: 'data:' + small.mimeType + ';base64,' + b64 } }, bytes: small.buffer.length, mime: small.mimeType });
     }
-    const hadImages = Array.isArray(imageParts) && imageParts.length > 0;
+    return { selected, hadImages: Array.isArray(imageParts) && imageParts.length > 0 };
+  }
+
+  async function callLiteApi(lc, systemPrompt, userText, preparedImages) {
+    if (!lc.apiKey) throw new Error('精简模式缺少 API key（config.socialV2.lite.apiKey 或环境变量 DEEPSEEK_API_KEY）');
+    // DeepSeek 的 chat/completions 其实支持 image_url（2026-10-22 实测 deepseek-chat
+    // 能正确描述图片内容）。以前「带图就 400」的真因是原图没压、请求体好几 MB 撞了
+    // 大小限制，不是不支持视觉 —— 所以压缩后再传，真的让她看见图。
+    const { selected, hadImages } = preparedImages;
+    const visionParts = selected.map((item) => item.vision);
+    const fromList = selected.map((item) => String(item.source._from || item.source._fromLabel || ''));
+    const seqList = selected.map((item) => String(item.source._replyRef || ''));
+    const videoNotes = selected.map((item) => item.source._videoNote).filter(Boolean).map(String);
     // 带图的这一轮：她容易把图当背景，直接接上一个话题抖机灵（2026-10-22 实测：
-    // 南禺发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
+    // 群友甲发了张捏着小虫子的图，她没看清就回「就这？我一口能吞十个」，被指出是虫子才改口）。
     const imgHint = visionParts && visionParts.length
       ? '\n（这轮带了图：先看清图里到底是什么东西、写了什么字，再决定说什么。别没看就接上一个话题。）'
       : '';
     if (hadImages && !visionParts.length) {
-      log('[lite] 这轮带了图但一张都没送出去（part 里没有可解码的图片数据）');
+      log('[lite] 这轮带了图但一张都没送出去（获取、处理或预算限制导致未附图）');
     }
-    const imgNote = hadImages && !visionParts.length ? '\n（这轮本来带了图，但图没取到，别硬编图里有什么）' : '';
+    const imgNote = hadImages && !visionParts.length ? '\n（桥接已确认本轮未送入任何图片；你看不到图片内容，不要猜测或编造。）' : '';
     // 多张图一起塞进去时她分不清哪张是谁的 —— 2026-10-23 实测：群里同时有「B站视频抽帧图」
-    // 和「南禺发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
-    // 所以按顺序编号，并点明哪一张是视频。
+    // 和「群友甲发的两张游戏图」，她拿群友的图当视频内容答了（说成"小肥鱼大冒险"）。
+    // 所以按图片顺序列出来源，并点明视频抽帧图。
     // 只要带了图就说明「哪张是谁发的」，哪怕只有 1 张（2026-10-26）：
     // 以前只在 >1 张时才编号，于是「1 张图 + 上下文里两条［带图］」时她随便挑一条
-    // 认领，实测把朵莉亚的表情包当成主人发的。顺带把「没附给你的图别猜」也讲明。
+    // 认领，实测把群友丙的表情包当成主人发的。顺带把「没附给你的图别猜」也讲明。
     let multiNote = '';
     if (visionParts.length) {
       const bits = [];
@@ -4556,15 +4595,16 @@ async function main() {
         // _replyRef 由 deliverLiteV2 在附图清单定稿前写入；没有就明说不可引用，
         // 避免让模型填一个会被拒绝的 mN。
         const ref = String(seqList[i] || '').trim();
-        bits.push('第 ' + (i + 1) + ' 张＝' + (isSheet ? '视频抽帧图（每格标着对应的时间点）' : (nm ? nm + ' 发的图' : '群友发的图'))
-          + (ref ? '（来源消息 [' + ref + ']，引用就填 "' + ref + '"）' : (isSheet ? '' : '（没有可引用的来源消息编号，别猜 replyTo）')));
+        bits.push('img' + (i + 1) + ' = ' + (isSheet ? '视频抽帧图（每格标着对应的时间点）' : (nm ? nm + ' 发的图' : '群友发的图'))
+          + (ref ? '（来源消息 [' + ref + ']，引用就填 "' + ref + '"）' : '（没有可引用的来源消息编号，别猜 replyTo）'));
       }
-      multiNote = '\n（本轮实际附图清单：共 ' + visionParts.length + ' 张图，按顺序：' + bits.join('；') + '。'
+      multiNote = '\n（本轮实际附图清单：共 ' + visionParts.length + ' 张图，按顺序：' + '\n' + bits.join('\n') + '\n' + '。'
         + '上下文里标［图没附给你］的那些图片**你看不到内容**，别猜、别说它上面有什么字；'
-        + '只有本清单列出的图才实际附上了；［候选附图］不代表已送达。'
+        + '只有本清单列出的图才实际附上了。对群友指代图片时，用谁发的加实际看清的画面特征，例如「群友乙发的坦克那张」「刚才那张大眼睛的」；不要说「第几张」或 imgN 等内部编号。多条回复分别说不同图片时，每条都要自己明确指代；没看清就直说，别编造。'
         + '引用某张图时，replyTo 只填清单里给出的来源消息编号（如 m123）；'
         + '昵称、QQ 号、时间都不接受，填了不会引用（不会替你猜「那个人最近一条」）。'
-        + '要回应图就 @ 发这张图的那个人——「谁发的图」和「谁把你叫醒」是两回事，别 @ 错。）';
+        + '要回应图就 @ 发这张图的那个人——「谁发的图」和「谁把你叫醒」是两回事，别 @ 错。'
+        + '问这是谁时先回答身份判断（确定、像或拿不准），再说细节；发图的人不等于图中人。此前同图答复仅是线索，可依新画面或群友纠正改变判断。reply 可用字符串数组和顶层 replyTo，也可选用对象 {text,imageRef,replyTo,at}；若填写 imageRef，只选一张 imgN，若同时引用则 replyTo 填该图来源编号；没有可引用来源则省略 replyTo。）';
       if (fromList.includes('视频抽帧拼图')) {
         multiNote += '有人问「这个视频讲了什么」时只看视频抽帧那张，别把群友发的图当成视频内容。'
           // 2026-11-02：她说「第 5 格那个鼓着腮帮子的，是我吧」——格号只有她看得到。
@@ -4574,7 +4614,7 @@ async function main() {
     }
     const videoDetail = videoNotes.length ? (String.fromCharCode(10) + videoNotes.join(String.fromCharCode(10))) : '';
     const userContent = visionParts.length
-      ? [{ type: 'text', text: cleanForJson(userText + imgNote + imgHint + multiNote + videoDetail) }, ...visionParts]
+      ? [{ type: 'text', text: cleanForJson(userText + imgNote + imgHint + multiNote + videoDetail) }, ...selected.flatMap((item, i) => [{ type: 'text', text: 'img' + (i + 1) + '：' + (item.source._from || '未知来源') + (item.source._replyRef ? ' 来源[' + item.source._replyRef + ']' : '（无可引用来源）') }, item.vision])]
       : cleanForJson(userText + imgNote + videoDetail);
     const body = {
       model: lc.model,
@@ -4613,7 +4653,7 @@ async function main() {
 
   /** 执行模型给的动作：发送、发表情、收尾。 */
 
-  async function applyLiteActionsV2(key, st, actions, replyTargets = new Map()) {
+  async function applyLiteActionsV2(key, st, actions, replyTargets = new Map(), selectedImages = []) {
     const report = { sent: 0, sticker: null, finish: null, errors: [] };
     const kind = key.startsWith('private:') ? 'private' : 'group';
     const id = Number(key.split(':')[1]);
@@ -4658,7 +4698,7 @@ async function main() {
     }
     // ⓪.4 唱歌：曲库里找歌，整个文件当语音条发出去（不走 TTS）。
     // 2026-10-28 加：之前只有 voice（TTS 说话），群里让她唱歌，她用 voice 说「我只学了半首」，
-    // 被追问「语音不能发吗」只能答「得问南禺」——因为根本没有「唱」这个动作。
+    // 被追问「语音不能发吗」只能答「得问群友甲」——因为根本没有「唱」这个动作。
     if (actions.sing !== undefined && actions.sing !== null && String(actions.sing).trim()) {
       const want = String(actions.sing).trim().slice(0, 40);
       try {
@@ -4716,31 +4756,26 @@ async function main() {
     const rawReply = actions.reply;
     // 模型偶尔把几句话塞进一个字符串用换行隔开（实测 09:42 那条「管白饭啊\n\n那可以\n\n就冲白饭」），
     // 发出去就是一条多行气泡，跟「拆成几条短消息」的节奏不一样。这里按行拆开（2026-10-22）。
-    const msgs = (Array.isArray(rawReply) ? rawReply : (typeof rawReply === 'string' ? [rawReply] : []))
-      .flatMap((x) => String(x ?? '').split(/\r?\n+/))
-      .map((x) => litePrompt.cleanLiteReplyText(x, st))
-      .filter(Boolean)
-      // 整条被括号包住的是「动作描写 / 旁注」，不是要说的话。人格卡明确禁止发出来，
-      // 实测降级轮发过「（睡醒了，尾巴甩了一下）」（2026-10-26）。
-      .filter((x) => !/^[（(][\s\S]{4,}[）)]$/.test(x));
-    // 以前这里直接 slice(0,3) 静默丢弃：模型生成了 4 条、群里只出现 3 条，
-    // 而 prompt 里还写着「最多 5 条」，两边不一致（2026-10-23 主人发现少了一句）。
-    // 一轮最多 3 条（原 4）。实测 16:16 那轮：主人连发 3 条短句，她每条都回 2-3 句，
-    // 变成「主人说 1 句、她说 2.7 句」，看着像她在自言自语（2026-10-26）。
+    const rows = (Array.isArray(rawReply) ? rawReply : (typeof rawReply === 'string' ? [rawReply] : []))
+      .flatMap((x, originalIndex) => { const meta = x && typeof x === 'object' && !Array.isArray(x) ? x : {}; return String(meta === x ? (x.text || '') : (x ?? '')).split(/\r?\n+/).map((line, lineIndex) => ({ ...meta, __isObject: meta === x, __inheritTop: meta === x && originalIndex === 0 && lineIndex === 0, text: litePrompt.cleanLiteReplyText(line, st) })); })
+      .filter((x) => x.text && !/^[\uFF08(][\s\S]{4,}[\uFF09)]$/.test(x.text));
+    const msgs = rows.map((x) => x.text);
     const BURST_CAP = 3;
     if (msgs.length > BURST_CAP) {
       log('[lite] 生成了 ' + msgs.length + ' 条，只发前 ' + BURST_CAP + ' 条（丢弃：' + msgs.slice(BURST_CAP).map((x) => String(x).slice(0, 20)).join(' / ') + '）');
       msgs.length = BURST_CAP;
+      rows.length = BURST_CAP;
     }
     if (msgs.length) {
       try {
         const maxChars = Math.max(1, Number(cfg.socialV2?.send?.maxMessageChars) || 500);
-        const safe = msgs.map((m) => m.slice(0, maxChars)).filter((m) => !SENSITIVE_RE.test(m));
+        const safeRows = rows.map((r) => ({ ...r, text: r.text.slice(0, maxChars) })).filter((r) => !SENSITIVE_RE.test(r.text));
+        const safe = safeRows.map((r) => r.text);
         if (safe.length) {
           const delays = computeGapsV2(safe, 'auto', 0, [], cfg.socialV2?.send ?? {});
           // 2026-11-02：lite 只认本轮展示过的消息编号（消息行开头的 [m123]）。
           // 不再把昵称/QQ 号猜成「那个人最近的一条」——那样会引用到他后面发的另一条
-          // （实测：她看到 22:14 的游戏图，replyTo 填了发送人，引用落到他 22:17 发的另一张图）。
+          // （实测：她看到 22:14 的游戏图，replyTo 填「群友乙」，引用落到他 22:17 发的猫图）。
           // 解析不到就不引用，宁可少一个引用，也不要引错。
           let replyTo;
           let replyTarget = null;
@@ -4778,7 +4813,7 @@ async function main() {
             else report.errors.push(`要 @ 的「${rawAt}」在最近消息里找不到对应 QQ 号，已跳过 @`);
           }
           // 一致性兜底（2026-10-26）：replyTo 指向 A、at 指向 B，而回复里根本没提 B ——
-          // 说明模型把「我引用的那条」和「我要 @ 的人」搞混了（实测：引用朵莉亚的「菜呢」，
+          // 说明模型把「我引用的那条」和「我要 @ 的人」搞混了（实测：引用群友丙的「菜呢」，
           // 却 @ 了半小时前端白饭的「。」）。宁可不 @，也不 @ 错。
           if ((replyTo || rawReplyToText) && atUser && kind === 'group') {
             try {
@@ -4808,7 +4843,27 @@ async function main() {
               }
             } catch (e) { /* 校验失败不影响发送 */ }
           }
-          const sent = await sendMessagesV2(key, safe, delays, replyTo, atUser);
+          const routes = [];
+          for (let i = 0; i < safeRows.length; i++) {
+            const row = safeRows[i];
+            if (!row.__isObject) { routes.push(null); continue; }
+            const rowReplyTo = row.replyTo || (row.__inheritTop ? actions.replyTo : '');
+            const target = replyTargets.get(String(rowReplyTo || '').replace(/^\[(m[1-9]\d*)\]$/, '$1'));
+            let mid = null;
+            if (target) { try { if (await resolveReplyInfo(kind, id, String(target.messageId))) mid = String(target.messageId); } catch {} }
+            const rawAt = String(row.at || (row.__inheritTop ? actions.at : '') || '').replace(/^@/, '');
+            const atTarget = kind === 'group' && rawAt ? (st.recentMessages || []).filter((m) => !m.isSelf && (String(m.userId || '') === rawAt || m.sender === rawAt)).pop() : null;
+            const uid = atTarget?.userId && (!target?.userId || String(target.userId) === String(atTarget.userId)) ? String(atTarget.userId) : null;
+            routes.push({ replyTo: mid, at: uid });
+          }
+          const sent = await sendMessagesV2(key, safe, delays, replyTo, atUser, routes);
+          const historyByHash = new Map();
+          for (let i = 0; i < safeRows.length; i++) {
+            const ref = safeRows[i].imageRef || (selectedImages.length === 1 ? 'img1' : '');
+            const item = /^img[1-9]\d*$/.test(ref) ? selectedImages[Number(ref.slice(3)) - 1] : null;
+            if (item) historyByHash.set(item.hash, [...(historyByHash.get(item.hash) || []), safeRows[i].text]);
+          }
+          for (const [hash, lines] of historyByHash) liteImageHistory.put(key, hash, lines.join('\n'));
           recordSentMessagesV2(key, sent);
           // 2026-10-26：lite 是直接调 onebot 发的，不走 MCP 工具，所以从来没写进
           // tool-calls.jsonl —— 冷存储里只有群友的话、没有她自己说的（who 分布里一条「我」都没有）。
@@ -4847,19 +4902,15 @@ async function main() {
     // ② 表情（单独一张，不和文字同气泡）
     if (actions.sticker) {
       try {
-        const entry = findStickerByLabel(actions.sticker);
+        const entry = imageLibrary.match(actions.sticker);
         if (entry) {
-          await sendStickerV2(key, entry.id, {});
-          report.sticker = entry.localNote || entry.id;
-        } else {
-          report.errors.push(`没有标签为「${actions.sticker}」的表情`);
-        }
+          await sendStickerV2(key, entry.id || entry.sha256, { material: entry, context: actions.sticker });
+          report.sticker = actions.sticker;
+        } else log('[pic] 标签未命中: ' + String(actions.sticker).replace(/[\r\n]/g, ' '));
       } catch (error) {
-        report.errors.push(`表情失败：${error?.message ?? error}`);
+        report.errors.push(`图片发送失败：${error?.message ?? error}`);
       }
     }
-    // ②' 拍一拍（2026-10-26）：和 sticker 一样是「说话之外的附带动作」。
-    // lite 没有工具循环，所以跟 forward 一个思路 —— 模型只填要拍谁，桥接解析 + 执行。
     if (actions.poke !== undefined && actions.poke !== null && String(actions.poke).trim() !== '') {
       try {
         const rawPoke = String(actions.poke).trim();
@@ -5167,7 +5218,7 @@ async function main() {
   const LITE_TURN_KEEP = 2000;
 
   /** 记下这一轮她看到的上下文和原始输出（诊断「逻辑不清」只能靠这个现场）。 */
-  function dumpLiteTurn(key, reason, userText, rawReply, report) {
+  function dumpLiteTurn(key, reason, userText, rawReply, report, actions) {
     try {
       const row = {
         t: Date.now(),
@@ -5185,6 +5236,8 @@ async function main() {
         })(),
         ctx: String(userText || '').slice(0, 6000),
         raw: String(rawReply || '').slice(0, 2000),
+        replyHasInternalImageId: (Array.isArray(actions?.reply) ? actions.reply : [actions?.reply])
+          .some((item) => /\bimg[1-9]\d*\b|第\s*(?:[0-9]+|[零〇一二三四五六七八九十百两几]+)\s*张/i.test(typeof item === 'string' ? item : String(item?.text || ''))),
         sent: report?.sent ?? 0,
         imgs: Array.isArray(report?.imgs) ? report.imgs : undefined,
         errors: Array.isArray(report?.errors) ? report.errors.slice(0, 3) : []
@@ -5256,26 +5309,28 @@ async function main() {
     if (!lc.enabled) throw new Error('精简模式未开启');
     const st = getSocialV2State(key);
     // 2026-10-27：唤醒她的那条消息本身不带图时，只要这轮在聊「图」，就把最近 5 分钟内的图补上。
-    // 背景：22:36 群里连发两张图，22:37 南禺说「我加实图了」，唤醒来的是那句纯文字，
+    // 背景：22:36 群里连发两张图，22:37 群友甲说「我加实图了」，唤醒来的是那句纯文字，
     // media 为空 → 图一张都没附，她只能回「加了图还是看不到嘛」。
     // 只在「这条消息确实在说图」时才补，避免每轮都塞旧图让她把旧图当新图。
     if (!Array.isArray(media) || media.length === 0) {
       const lastIn = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
-      const talkAboutPic = lastIn && /图|看到|看见|看不见|看不清|发了|加的/.test(String(lastIn.text || ''));
-      if (talkAboutPic) {
+      const identityQuestion = lastIn && /这是谁|那是谁|是谁呀|是谁啊/.test(String(lastIn.text || ''));
+      const talkAboutPic = lastIn && (/图|看到|看见|看不见|看不清|发了|加的/.test(String(lastIn.text || '')) || identityQuestion);
+      if (talkAboutPic || reason === 'poke') {
         const nowMs = Date.now();
-        const picked = (Array.isArray(st.recentMessages) ? st.recentMessages : [])
-          .filter((m) => m && m.hasMedia && Array.isArray(m.media) && m.media.length
-            && nowMs - Number(m.time || 0) < 5 * 60 * 1000)
-          .slice(-2)
+        const candidates = (Array.isArray(st.recentMessages) ? st.recentMessages : [])
+          .filter((m) => m && m.hasMedia && Array.isArray(m.media) && m.media.some((md) => ['image', 'sticker', 'face'].includes(md?.kind))
+            && nowMs - Number(m.time || 0) >= 0 && nowMs - Number(m.time || 0) < 5 * 60 * 1000)
+          .slice(-2);
+        const picked = (identityQuestion && reason !== 'poke' && (candidates.length !== 1 || candidates[0].media.length !== 1) ? [] : (reason === 'poke' ? candidates.slice(-1) : candidates))
           // 2026-11-02：补图分支也要带来源（发送人 + 消息 seq），否则这些图进入 ctx 时
           // 没有可引用的来源编号，模型又只能猜。
-          .flatMap((m) => (m.media || []).map((md) => Object.assign({}, md, {
-            _fromName: String(m.sender || ''),
-            _fromUid: m.userId ? String(m.userId) : '',
+          .flatMap((m) => (m.media || []).filter((md) => ['image', 'sticker', 'face'].includes(md?.kind)).map((md) => Object.assign({}, md, {
+            _fromName: md._quoted ? String(md._sourceName || md._fromName || '') : String(m.sender || ''),
+            _fromUid: md._quoted ? String(md._sourceUserId || '') : (m.userId ? String(m.userId) : ''),
             _seq: Number.isSafeInteger(Number(m.seq)) ? Number(m.seq) : 0,
           })))
-          .slice(0, 2);
+          .slice(reason === 'poke' ? -1 : 0, reason === 'poke' ? undefined : 2);
         if (picked.length) {
           media = picked;
           log('[lite] ' + key + ' 这轮在聊图，补上最近 ' + media.length + ' 张');
@@ -5315,15 +5370,7 @@ async function main() {
         .map((m) => Number(m && m._seq))
         .filter((n) => Number.isSafeInteger(n) && n > 0)
     );
-    const replyTargets = new Map();
-    const userText = litePrompt.buildLiteUserMessage(key, reason, snapshot, research, sweep, mediaSeqs, fwd, replyTargets);
     const imageParts = Array.isArray(media) && media.length ? await resolveMediaList(media) : [];
-    // 每张图对应的发送人，顺序跟 imageParts 一致（供 callLiteApi 写进提示词）
-    const imgFrom = (Array.isArray(media) ? media : []).map((m) => ({
-      name: m && m._fromName ? String(m._fromName) : ''
-    }));
-    // 这一轮要是有视频（QQ 视频消息 或 消息里的 B 站链接），抽一张帧拼图放在最前面。
-    // 放在前面是因为 callLiteApi 只取前 3 张图，视频内容才是这轮的重点。
     try {
       const videoSrc = videoMod.findVideoSourceV2(st);
       // 2026-10-31：同一个视频只抽一次。原来每轮都能重新找到同一个 B 站卡片，
@@ -5338,7 +5385,6 @@ async function main() {
         const sheet = await videoMod.videoToSheet(videoSrc.source);
         if (sheet && sheet.buffer) {
           imageParts.unshift({ type: 'image', mediaType: 'image/jpeg', data: sheet.buffer.toString('base64'), name: 'video-sheet.jpg', _from: '视频抽帧拼图', _videoNote: String(sheet.note || '') });
-          imgFrom.unshift({ name: '视频抽帧拼图' });
           st.videosSeen = [...(Array.isArray(st.videosSeen) ? st.videosSeen : []), vKey].slice(-20);
         }
       }
@@ -5348,14 +5394,20 @@ async function main() {
     // 2026-11-02（GPT review P2）：附图清单只公布映射表里真实存在的编号。
     // 在调用 API 前定稿：_replyRef 为空 = 这张图没有可引用的来源消息。
     // 引用老图（B 引用了 A 的图）没有可靠的原消息编号，不能借用 B 的编号。
-    for (const p of (Array.isArray(imageParts) ? imageParts : [])) {
-      if (!p || p.type !== 'image') continue;
+    const preparedImages = prepareLiteImages(imageParts);
+    const attachedSeqs = new Set(preparedImages.selected.map(({ source }) => Number(source._seq))
+      .filter((n) => Number.isSafeInteger(n) && n > 0));
+    const replyTargets = new Map();
+    const userText = litePrompt.buildLiteUserMessage(key, reason, snapshot, research, sweep, attachedSeqs, fwd, replyTargets);
+    for (const { source: p } of preparedImages.selected) {
       const seq = Number(p._seq);
       const ref = Number.isSafeInteger(seq) && seq > 0 ? 'm' + seq : '';
       p._replyRef = (!p._quoted && ref && replyTargets.has(ref)) ? ref : '';
     }
+    const historyNote = preparedImages.selected.map((item, i) => { const prior = liteImageHistory.get(key, item.hash); return prior ? 'img' + (i + 1) + ' 此前答复（仅供参考，可按新画面或群友纠正）：' + prior : ''; }).filter(Boolean).join('\n');
+    const imageUserText = userText + (historyNote ? '\n' + historyNote : '');
     const started = Date.now();
-    let result = await callLiteApi(lc, systemPrompt, userText, imageParts, imgFrom);
+    let result = await callLiteApi(lc, systemPrompt, imageUserText, preparedImages);
     // 2026-11-02：每发一次请求就记一笔。以前只有最后那一行记账，
     // 降级重试 / 事实题兜底重试的调用费全漏了（重试一次就是一份钱）。
     recordLiteUsage(key, result.usage, result.model, null);
@@ -5367,17 +5419,17 @@ async function main() {
     // 报了数字却一次都没查过，就让她重来一次（二选一：去搜，或者说记不准）。
     if (actions && !actions.__degraded && !research && !sweep) {
       const said = (Array.isArray(actions.reply) ? actions.reply : [actions.reply])
-        .filter(Boolean).map(String).join(' ');
+        .filter(Boolean).map((x) => typeof x === 'object' ? String(x.text || '') : String(x)).join(' ');
       const claimedNumber = /\d+\s*[.．]\s*\d+/.test(said) || /\d+\s*月\s*\d+\s*(日|号)/.test(said);
       // 只在「这一轮真的有人在问版本/期数/日期」时才管，否则她正常说个「1.5 倍」也会被拦下来重来
       const askedVersion = /几点几|什么版本|哪个版本|第几期|哪一期|什么时候出|几号出|哪个池子|什么卡池/.test(String(userText || ''));
       if (claimedNumber && askedVersion) {
         log('[lite] ' + key + ' 报了数字但这一轮没查过（"' + said.slice(0, 40) + '"），让她重来一次');
-        const hardUser = userText + '\n\n【这一轮重来】你刚才直接报了一个版本号/日期，但你**并没有查过**。'
+        const hardUser = imageUserText + '\n\n【这一轮重来】你刚才直接报了一个版本号/日期，但你**并没有查过**。'
           + '这一轮二选一：① 把要查的东西原样写进 research 字段，先搜、再根据结果回答；'
           + '② 直接说「这个我真记不准」。**不许凭印象报数字，也不要把上一个问题的答案换个名字再用一遍。**';
         try {
-          const retry = await callLiteApi(lc, systemPrompt, hardUser, imageParts, imgFrom);
+          const retry = await callLiteApi(lc, systemPrompt, hardUser, preparedImages);
           recordLiteUsage(key, retry.usage, retry.model, null);
           const retryActions = litePrompt.parseLiteActions(retry.text);
           if (retryActions && !retryActions.__degraded) {
@@ -5396,10 +5448,10 @@ async function main() {
     if (actions && actions.__degraded) {
       try {
         log('[lite] ' + key + ' 输出不是 JSON（降级），重试一次要求纯 JSON');
-        const retryUser = userText
+        const retryUser = imageUserText
           + '\n\n【必须按格式】你上一轮的输出不是 JSON 对象。这一轮**只输出一个 JSON 对象**，'
           + '不要解释、不要代码块、不要 JSON 以外的任何文字。字段照上面的说明填，没内容就省略。';
-        const retry = await callLiteApi(lc, systemPrompt, retryUser, imageParts, imgFrom);
+        const retry = await callLiteApi(lc, systemPrompt, retryUser, preparedImages);
         recordLiteUsage(key, retry.usage, retry.model, null);
         const retryActions = litePrompt.parseLiteActions(retry.text);
         if (retryActions && !retryActions.__degraded) {
@@ -5485,9 +5537,29 @@ async function main() {
       ? seenThrough
       : (Number.isSafeInteger(snapshot?.readThroughSeq) ? snapshot.readThroughSeq : null);
     if (st.__liteReadThrough !== null) st.lastActionAt = st.lastActionAt || Date.now();
-    const report = await applyLiteActionsV2(key, st, actions, replyTargets);
-    report.imgs = (Array.isArray(imageParts) ? imageParts : []).map((p) => { const r = mediaPartToBuffer(p); return { bytes: r ? r.buffer.length : 0, mime: r ? r.mimeType : '' }; });
-    dumpLiteTurn(key, reason, userText, result.text, report);
+    let imageErrors = validateImageReplies(actions?.reply, preparedImages.selected, actions?.replyTo);
+    if (imageErrors.length) {
+      try {
+        const retry = await callLiteApi(lc, systemPrompt, imageUserText + '\n【格式纠正】' + imageErrors.join('；') + '。reply 可用字符串数组和顶层 replyTo，也可选用对象 text、imageRef、replyTo、at；若填写 imageRef，须为存在的单个 imgN，若同时填写 replyTo 则须与该图来源一致；不可猜来源。', preparedImages);
+        recordLiteUsage(key, retry.usage, retry.model, null);
+        const next = litePrompt.parseLiteActions(retry.text);
+        if (next && !next.__degraded) { actions = next; result = retry; }
+      } catch (e) { log('[lite] 图片回复重试失败: ' + (e?.message ?? e)); }
+      imageErrors = validateImageReplies(actions?.reply, preparedImages.selected, actions?.replyTo);
+      if (imageErrors.length) {
+        const cleanReply = (r) => {
+          if (!r || typeof r !== 'object' || Array.isArray(r)) return r;
+          const { replyTo, imageRef, ...rest } = r;
+          return rest;
+        };
+        actions = { ...actions, reply: Array.isArray(actions.reply) ? actions.reply.map(cleanReply) : cleanReply(actions.reply), replyTo: null };
+        log('[lite] 图片回复校验失败，已降级发送: ' + imageErrors.join('；'));
+      }
+    }
+    const report = await applyLiteActionsV2(key, st, actions, replyTargets, preparedImages.selected);
+    if (imageErrors.length) report.errors.push('图片回复校验失败，已降级发送');
+    report.imgs = preparedImages.selected.map(({ bytes, mime, hash, source }, i) => ({ index: i + 1, imageRef: 'img' + (i + 1), sourceRef: source._replyRef || null, from: source._from || '', quoted: !!source._quoted, hash, bytes, mime }));
+    dumpLiteTurn(key, reason, imageUserText, result.text, report, actions);
     delete st.__liteReadThrough;
     report.ms = Date.now() - started;
     report.usage = result.usage;
@@ -5566,16 +5638,20 @@ async function main() {
     return delays;
   }
 
-  function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
+  function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null, routes = null) {
     // 一条消息里带换行 = 几句话被塞进同一格，QQ 里会显示成一条多行气泡。
     // 统一按行拆成多条，并重排延迟，保持「短句分条发」的节奏（2026-10-22）。
     const flat = [];
-    for (const m of (Array.isArray(messages) ? messages : [])) {
+    const flatRoutes = [];
+    let flattened = false;
+    for (const [index, m] of (Array.isArray(messages) ? messages : []).entries()) {
       const parts = String(m ?? '').split(/\r?\n+/).map((s) => s.trim()).filter(Boolean);
-      if (parts.length) flat.push(...parts);
+      if (parts.length !== 1 || parts[0] !== String(m ?? '')) flattened = true;
+      for (const part of parts) { flat.push(part); flatRoutes.push(routes?.[index] || null); }
     }
-    if (flat.length && flat.length !== messages.length) {
+    if (flattened) {
       messages = flat;
+      if (routes) routes = flatRoutes;
       delays = computeGapsV2(messages, 'auto', 0, [], cfg.socialV2?.send ?? {});
     }
     const assertSendAllowed = captureSendGuard(key);
@@ -5584,8 +5660,8 @@ async function main() {
     const failed = [];
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
-      const useReply = i === 0 ? replyToMessageId : null;
-      const useAt = i === 0 ? atUserId : null;
+      const useReply = routes?.[i] ? routes[i].replyTo : (i === 0 ? replyToMessageId : null);
+      const useAt = routes?.[i] ? routes[i].at : (i === 0 ? atUserId : null);
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
@@ -6490,8 +6566,74 @@ async function main() {
   }
 
   loadSocialV2State();
+  startLiteRecencyMaintenance();
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
+
+  // 与 daily-archive 的服务器本地时间一致；04:00 归档会停服，04:10 再建日卡。
+  // 不等待模型，不发 QQ 消息；异常只降级为已有卡。
+  function startLiteRecencyMaintenance() {
+    const HOUR = 3600000;
+    function keys() {
+      const found = new Set(socialV2.conversations.keys());
+      try {
+        for (const entry of fs.readdirSync(path.join(STATE_DIR, 'memory'), { withFileTypes: true })) {
+          if (entry.isDirectory() && /^(group|private)_\d+$/.test(entry.name)) found.add(entry.name.replace('_', ':'));
+        }
+      } catch {}
+      return [...found].filter((key) => canonicalV2Key(key) === key);
+    }
+    function dailyBoundary(now = new Date()) {
+      const at = new Date(now);
+      at.setHours(4, 10, 0, 0);
+      return at;
+    }
+    async function maintain(force = false) {
+      if (!litePrompt.liteConfig().enabled) return;
+      for (const key of keys()) {
+        try {
+          const card = readRecentCard({ stateDir: STATE_DIR, key });
+          const generatedAt = Date.parse(card?.generatedAt || '');
+          const stale = !Number.isFinite(generatedAt) || Date.now() - generatedAt > 26 * HOUR;
+          const lastDue = dailyBoundary();
+          if (lastDue.getTime() > Date.now()) lastDue.setDate(lastDue.getDate() - 1);
+          // 补偿停机错过的 04:10；已经完成本归档日的卡不重复计费。
+          if (stale || (force && generatedAt < lastDue.getTime())) {
+            await refreshRecentCard({ stateDir: STATE_DIR, key, cfg, log });
+          }
+          // 2026-11-03：每天补一张「昨天」的日摘要（历史可追溯；近况卡仍是 7 天滚动）。
+          try {
+            const y = new Date(Date.now() - 86400000);
+            const ds = `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
+            if (!readDailySummary({ stateDir: STATE_DIR, key, date: ds })) {
+              await buildDailySummary({ stateDir: STATE_DIR, key, date: ds, cfg, log });
+            }
+          } catch {}
+          refreshTodaySupplement({ stateDir: STATE_DIR, key, cfg });
+        } catch {}
+      }
+    }
+    function scheduleDaily() {
+      const now = new Date(), at = dailyBoundary(now);
+      if (at <= now) at.setDate(at.getDate() + 1);
+      const timer = setTimeout(() => {
+        void maintain(true).catch(() => {});
+        scheduleDaily();
+      }, at.getTime() - now.getTime());
+      timer.unref?.();
+    }
+    // 归档窗口重启时不抢跑；其余启动检查缺卡 / >26h 过期。
+    const now = new Date();
+    if (!(now.getHours() === 4 && now.getMinutes() < 10)) void maintain(true).catch(() => {});
+    scheduleDaily();
+    const hourly = setInterval(() => {
+      if (!litePrompt.liteConfig().enabled) return;
+      for (const key of keys()) {
+        try { refreshTodaySupplement({ stateDir: STATE_DIR, key, cfg }); } catch {}
+      }
+    }, HOUR);
+    hourly.unref?.();
+  }
 
   function isSocialEnabled() {
     return currentMode === 'reserved' && cfg.social?.enabled !== false;
@@ -8041,8 +8183,8 @@ async function main() {
     // 理由：①新话题的提问者会 @ 或叫名字，atMention / nameMention 已经覆盖；
     // ②话题进行中的问句由在场窗口 shouldJoinConversationV2 的第②条接住。
     // 留着它只有一个实际效果——别人问别人的问题，只要话里带「你……怎么……」就把她叫醒。
-    // 当天 20:35 的实例：刘森问「你感觉你性格怎么样」其实是问蓝色神秘生物，
-    // 她被打醒后抢答「软呀 / 但急了会咬人」，而那条 @蓝色神秘生物 4 秒后才到。
+    // 当天 20:35 的实例：群友丁问「你感觉你性格怎么样」其实是问某群友，
+    // 她被打醒后抢答「软呀 / 但急了会咬人」，而那条 @某群友 4 秒后才到。
     // 需要恢复时把 cfg.socialV2.wake.questionTrigger 设为 true。
     if (cfg.socialV2?.wake?.questionTrigger === true && tr.question && isDirectedAtAi(plainContent)) return 'question';
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
@@ -8166,7 +8308,7 @@ async function main() {
     // 2026-10-31 修：取图范围要和**这轮真的会展示的消息**对齐。
     // 原来图取 unread 最新的（slice(-8)），消息却取最旧的（wakeMessageLimit 条）——
     // 消息积压时两边完全错位：她拿到一张图、上下文里却没有那条消息，
-    // 只能猜是谁发的，于是把刘森发的视频安到最近说话的芬恩头上（实测 21:06）。
+    // 只能猜是谁发的，于是把群友丁发的视频安到最近说话的群友乙头上（实测 21:06）。
     // 现在只在「本轮会展示的那批消息」里取图，图一定有对应的发送人。
     const ctxLimit = Math.max(1, Number(cfg.socialV2?.context?.wakeMessageLimit) || 12);
     let src;
@@ -8187,7 +8329,7 @@ async function main() {
       for (const md of m.media) {
         if (!md || typeof md !== 'object') continue;
         // 挂上来源（2026-10-26）：以前只传图片本体，模型看到「1 张图 + 上下文里两条
-        // ［带图/表情］」根本分不清哪张是谁发的 —— 实测把朵莉亚发的表情包当成主人发的，
+        // ［带图/表情］」根本分不清哪张是谁发的 —— 实测把群友丙发的表情包当成主人发的，
         // 还追问「主人这是冲谁呀」。_ 前缀的字段不会进 API，只给提示词用。
         // 2026-11-02：引用图（md._quoted）按**原发送者**标，不按当前消息的 sender
         // 覆盖成引用者（GPT review P1）。图仍然归属于当前这条消息（_seq 不变，
@@ -8766,7 +8908,11 @@ async function main() {
     try {
       let cur = {};
       try { cur = JSON.parse(fs.readFileSync(HEALTH_FILE, 'utf8')); } catch {}
-      fs.writeFileSync(HEALTH_FILE, JSON.stringify({ ...cur, ...patch, updatedAt: Date.now() }, null, 2));
+      const next = { ...cur, ...patch, updatedAt: Date.now() };
+      // 2026-11-03：恢复后要清掉旧的 error，否则 ok:true 里还挂着「QQ 已掉线」，
+      // 排查和 watchdog 邮件都会误读。
+      if (next.ok === true) delete next.error;
+      fs.writeFileSync(HEALTH_FILE, JSON.stringify(next, null, 2));
     } catch (error) {
       log('[health] 写状态失败: ' + (error?.message ?? error));
     }
@@ -9106,6 +9252,25 @@ async function main() {
     // 因此必须先解析 quoteTargetIsSelf 再做空文本过滤，避免“只引用不附文”被漏掉。
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
+    // Collect current incoming group images in the background.
+    if (kind === 'group' && currentMode === 'reserved2' && cfg.socialV2?.lite?.enabled === true
+        && imageLibrary.limits.enabled && String(event.user_id) !== String(event.self_id)) {
+      for (const media of mediaList.filter(m => !m._quoted && (m.kind === 'image' || m.kind === 'sticker'))) {
+        setImmediate(async () => {
+          try {
+            const image = await fetchOneBotImage(media);
+            if (!image?.buffer?.length) return;
+            const entry = imageLibrary.add(image.buffer, image.mimeType, {
+              sourceKey: key, senderId: event.user_id, senderName: event.sender?.card || event.sender?.nickname,
+              messageTime: Number(event.time) ? Number(event.time) * 1000 : Date.now(),
+              messageId: event.message_id ?? event.msg_id, context: plainContent,
+            });
+            if (entry?.status === 'pending') imageTagger.enqueue({ ...entry, kind: 'image' });
+          } catch (error) { log('[pic] 入库失败: ' + (error?.message ?? error)); }
+        });
+      }
+    }
+
     // 纯 @ 不带字：这一行实际上**不会**截掉它 —— at 段会被 segmentsToText 转成「@昵称」
     // 文本，plainContent 非空，条件第一项就为 false（2026-10-21 核实过代码）。
     // atSelfOnly 只是多一层保险：万一将来 at 段的渲染方式变了，也不会把「只有 @ 没有字」
@@ -9150,7 +9315,7 @@ async function main() {
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     // 只有桥接自己的这几个命令才拦。别的以 / 开头的一律当聊天 ——
-    // 2026-10-26 实测：她教群友「@幻梦 /今日老婆」，群友照发，被这句
+    // 2026-10-26 实测：她教群友「@某官方机器人 /今日老婆」，群友照发，被这句
     // 「管理命令仅管理员可用」吃掉：她自己在教的东西，被自己的拦截器拦了。
     const KNOWN_ADMIN_CMD = /^\/(?:reset|new|status|role|人格|silent|quiet|active|speak)(?:\s|$)/;
     if (plainContent.startsWith('/') && KNOWN_ADMIN_CMD.test(plainContent)) {
@@ -9579,7 +9744,7 @@ async function main() {
     } else if (st.wakeConfig?.triggers?.poke) {
       // 2026-10-27 修复：群里「A 拍 B」同样会推 poke 事件。以前这里只看 triggers.poke，
       // 不判断 target_id，于是任何一次拍别人都会把她叫醒，prompt 里还写成「X 拍了你一下」——
-      // 表现为「刘森拍蓝色神秘生物 → 她当成拍自己 → 连问『那你拍的是谁呀』」。
+      // 表现为「群友丁拍某群友 → 她当成拍自己 → 连问『那你拍的是谁呀』」。
       // 有 target_id 就严格比对；老运行时可能不传 target_id，那种情况才保守放行（宁可多醒一次）。
       if (targetIsSelf || !targetId) {
         // 2026-11-02：把"是谁拍的"显式带进唤醒上下文。以前这里不带，

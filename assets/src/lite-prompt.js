@@ -1,3 +1,4 @@
+import { materialLabels } from './image-library.mjs';
 // lite（精简模式）的提示词构造与输出解析。
 // 从 bridge.js 拆出：原来这 5 个函数是 main() 里的闭包，靠外部变量通信；
 // 现在改为参数注入，模块本身不读 config、不碰全局状态。
@@ -11,6 +12,7 @@ export function createLitePrompt(deps) {
     nicknameOf,
     describeLiking, detectThread,
     recallColdStorage, triggerWantsRecall,
+    getRecentContext,
     currentRoleHintV2, songsHint, ttsCfg,
     likingData, LITE_SYSTEM_TEMPLATE, ROLE_MAX_CHARS,
   } = deps;
@@ -34,22 +36,14 @@ export function createLitePrompt(deps) {
       recentLimit: Math.max(0, Math.min(100, Number(l.recentLimit) || 30)),
       maxTokens: Math.max(200, Math.min(4000, Number(l.maxTokens) || 1200)),
       timeoutMs: Math.max(5000, Math.min(120000, Number(l.timeoutMs) || 30000)),
-      stickerHints: Math.max(0, Math.min(120, Number(l.stickerHints) || 60))
+      stickerHints: Math.max(0, Math.min(120, (Number.isFinite(Number(l.stickerHints)) && l.stickerHints != null ? Number(l.stickerHints) : 60)))
     };
   }
 
   function buildLiteSystemPrompt() {
     const lc = liteConfig();
     const role = String(currentRoleHintV2() ?? '').trim() || '你是一只叫「大肥鱼」的鲸鱼娘，说话短、有脾气。';
-    const labels = [];
-    const seen = new Set();
-    for (const e of (Array.isArray(stickerEntries) ? stickerEntries : [])) {
-      const note = String(e?.localNote ?? '').trim();
-      if (!note || seen.has(note)) continue;
-      seen.add(note);
-      labels.push(note);
-      if (labels.length >= lc.stickerHints) break;
-    }
+    const labels = materialLabels(Array.isArray(stickerEntries) ? stickerEntries : [], lc.stickerHints);
     const voiceOn = ttsCfg().enabled;
     const voiceField = voiceOn
       ? '  "voice": "想用语音说的一句话（10~40字，会单独发成一条语音，别和 reply 重复）",'
@@ -63,7 +57,7 @@ export function createLitePrompt(deps) {
         ? (log('[role] 人格卡 ' + role.length + ' 字符，超过上限 ' + ROLE_MAX_CHARS + '，已截断尾部（请精简或调大 ROLE_MAX_CHARS）'),
            role.slice(0, ROLE_MAX_CHARS))
         : role)
-      .replace('{{STICKERS}}', labels.length ? labels.join('、') : '（暂无）')
+      .replace('{{STICKERS}}', labels.length ? labels.join('、') : '这一轮不要填 sticker')
       .replace('{{VOICE_FIELD}}', voiceField)
       .replace('{{VOICE_RULES}}', voiceRules)
       .replace('{{SONGS}}', songsHint());
@@ -103,6 +97,12 @@ export function createLitePrompt(deps) {
       const head = thread.rows.map((r) => (r.type === 'gap' ? { __gap: r.n } : { ...r.m, __old: true }));
       list = [...head, ...list];
     }
+    // 日卡位于整个 user 前缀，顺序和截至时间日内固定；补充另段按本轮去重。
+    // 依赖缺失 / 卡不可读时保持原提示词，失败不能影响本轮聊天。
+    try {
+      const context = getRecentContext?.({ stateDir: STATE_DIR, key, recent: list, cfg });
+      if (typeof context === 'string' && context) parts.push(context, '');
+    } catch {}
     if (list.length) {
       const headLine = key.startsWith('private:')
         ? '【你和 TA 的私聊】（旧 → 新；括号里是 QQ 号，「你」是你自己）'
@@ -143,12 +143,12 @@ export function createLitePrompt(deps) {
         const rel = m.quoteTargetIsSelf ? ' →回你' : '';
         // 带图的两条消息连着出现时，她分不清图是谁的（2026-10-26 实测）。这里明写
         // 「这张图附给你了没有」——没附的那条她看不到内容，就不该猜。
-        // 2026-11-02：真实附图清单以文末「实际附图清单」为准（候选 ≠ 已送达），
+        // 消息行和文末附图清单都基于最终发送的图片集合，
         // 这样「消息行说附了、请求里其实没带」不会再骗她。
         let imgTag = '';
         if (m.hasMedia) {
           const mine = attachedSeqs && Number.isSafeInteger(Number(m.seq)) && attachedSeqs.has(Number(m.seq));
-          imgTag = mine ? '［候选附图，以文末实际附图清单为准］' : '［图没附给你，你看不到这条的图］';
+          imgTag = mine ? '［本条有图实际附上，以文末清单为准］' : '［图没附给你，你看不到这条的图］';
         }
         // 捞回来的旧消息要和「现在正聊的」区分开（2026-10-26）：实测她会把两小时前的
         // 「我给你兜底」当成待回应的事，隔一会儿又问一遍「那个兜底还算不算数」。
@@ -182,6 +182,11 @@ export function createLitePrompt(deps) {
     // 2026-11-02：以前这里读 lastWakeUserId（只有普通群消息会更新），
     // 于是「群友 A 拍了 bot → bot 被写成『主人拍了你』→ 她 @ 主人」。
     // 现在读本轮冻结的唤醒者：undefined = 调用方还没接上（回退旧字段），null = 没有人类触发者。
+    const pokeHasFreshContent = (Array.isArray(snapshot?.messages) ? snapshot.messages : []).some((m) => {
+      if (!m || m.isSelf || m.kind === 'poke' || m.poke || String(m.text || '').trimStart().startsWith('[拍一拍]')) return false;
+      return !!String(m.text || '').trim() || !!m.hasMedia || (Array.isArray(m.media) && m.media.length > 0);
+    });
+    if (reason === 'poke' && pokeHasFreshContent) parts.push('（拍一拍只是唤醒；本轮同时有新消息或媒体，请一并回应实际内容。）');
     const frozenActor = st.wakeActorId;
     const wakeUser = String((frozenActor === undefined ? st.lastWakeUserId : frozenActor) ?? '').trim();
     if (wakeUser) {
@@ -195,7 +200,7 @@ export function createLitePrompt(deps) {
         const rs = String(reason || '');
         const why = rs === 'atMention' ? '在群里 @ 了你'
           : rs === 'nameMention' ? '叫了你的名字'
-          : rs === 'poke' ? '拍了你一下（拍一拍，**没有附任何文字**）'
+          : rs === 'poke' ? (pokeHasFreshContent ? '拍了你一下；同时有新消息，先看消息再回应' : '拍了你一下（拍一拍，**没有附任何文字**）')
           : rs === 'question' ? '在群里问了个问题'
           : rs.startsWith('keyword') ? '你被关键词叫醒了'
           : rs === 'presence' ? '你刚回过话，群里接着说'
@@ -204,7 +209,7 @@ export function createLitePrompt(deps) {
           : '';
         parts.push('【这次为什么醒】' + wn + '(' + wakeUser + ') ' + (why || rs));
         if (rs === 'poke') {
-          parts.push('（拍一拍只是戳你一下，没有内容。你可以顺着群里正在聊的接一句、可以反问、也可以只吐槽被拍，'
+          parts.push((pokeHasFreshContent ? '（拍一拍只是戳你一下；本轮另有新内容，优先看并回应这些新内容，' : '（拍一拍只是戳你一下，没有内容。你可以顺着群里正在聊的接一句、可以反问、也可以只吐槽被拍，')
             + '**不需要为了「回应他」专门 @ 他**；要 @ 谁，看你这句话实际在跟谁说。）');
         }
         // 一轮里可能有好几个人连着拍（2026-10-26 实测：「。」拍了两次还追问「宕机了？」，

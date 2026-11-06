@@ -20,7 +20,14 @@ CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST "http://$BOT_IP:3000/
 systemctl is-active --quiet qqbridge || problems+=("qqbridge 服务没在运行")
 
 if [ -f "$BASE/state/health.json" ]; then
-  grep -q "\"ok\": *false" "$BASE/state/health.json" && problems+=("health.json 记录为掉线")
+  # 2026-11-03：只信 10 分钟内的状态。bridge 重启/恢复后 health.json 可能还停在旧的
+  # ok:false，watchdog 会据此误报（21:30 那封「已经好了还在报掉线」就是这么来的）。
+  HEALTH_FRESH=$(python3 -c "import json,sys,time; d=json.load(open(sys.argv[1])); print('1' if time.time()*1000-d.get('updatedAt',0) < 600000 else '0')" "$BASE/state/health.json" 2>/dev/null || echo 1)
+  if [ "$HEALTH_FRESH" = "1" ]; then
+    grep -q "\"ok\": *false" "$BASE/state/health.json" && problems+=("health.json 记录为掉线")
+  else
+    log "health.json 超过 10 分钟没更新，跳过判断（避免读到重启前的旧状态）"
+  fi
 fi
 
 if [ ${#problems[@]} -eq 0 ]; then
