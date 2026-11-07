@@ -174,6 +174,7 @@ node recall.mjs github --limit=3    # 最多展开 3 处命中
 
 - **DSH 端 preset 没装** → QQ 上毫无反应，日志也不报错
 - **`allowAllWhenEmpty: true`** → 白名单空着就放行全部，等于把账号交给模型
+- **`allowAllPrivate: true`** → 私聊全放行（群友可以直接找她，不用一个个加白名单），`deny.private` 优先级更高；群聊不受影响，仍然只认 `allow.groups`
 - **把 WS 端口填进 `httpUrl`** → 报 HTTP 426
 - **NapCat 容器重启后要重新扫码**，登录态不一定保得住
 - **掉线时告警别走 QQ** —— QQ 都挂了，消息发不出去

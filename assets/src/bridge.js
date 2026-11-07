@@ -735,6 +735,9 @@ function loadConfig() {
     },
     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
+    // 私聊单独放行（2026-11-07 主人要求）：群友可以直接私聊她，不用一个个加白名单。
+    // 只影响 private:*，群聊仍然看 allow.groups；deny.private 优先级更高，要挡谁写那里。
+    allowAllPrivate: file.allowAllPrivate === true,
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -1429,6 +1432,8 @@ function allowed(kind, id, cfg) {
   const s = String(id);
   const denyList = cfg.deny[kind] ?? cfg.deny[kind + 's'] ?? [];
   if (denyList.map(String).includes(s)) return false;
+  // 私聊默认放行：不管白名单填没填，private:* 一律放行（deny.private 仍是例外）。
+  if (kind === 'private' && cfg.allowAllPrivate === true) return true;
   const allowList = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
   if (allowList.length > 0) return allowList.map(String).includes(s);
   return cfg.allowAllWhenEmpty;
@@ -2571,6 +2576,9 @@ async function main() {
     return parts.join('\n\n') + '\n\n' + promptText;
   }
 
+  if (cfg.allowAllPrivate) {
+    log('ℹ️  allowAllPrivate=true：所有私聊都会转发给 agent（deny.private 里的人除外）');
+  }
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
     log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
   } else if (!cfg.allow.private.length && !cfg.allow.groups.length) {
