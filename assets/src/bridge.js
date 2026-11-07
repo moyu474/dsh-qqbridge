@@ -3444,55 +3444,94 @@ async function main() {
     file.allow = file.allow && typeof file.allow === 'object' ? file.allow : {};
     file.allow.groups = Array.isArray(file.allow.groups) ? file.allow.groups.map(Number).filter(Boolean) : [];
     file.allow.private = Array.isArray(file.allow.private) ? file.allow.private.map(Number).filter(Boolean) : [];
+    file.deny = file.deny && typeof file.deny === 'object' ? file.deny : {};
+    file.deny.groups = Array.isArray(file.deny.groups) ? file.deny.groups.map(Number).filter(Boolean) : [];
+    file.deny.private = Array.isArray(file.deny.private) ? file.deny.private.map(Number).filter(Boolean) : [];
 
     const parts = raw.split(/\s+/);
     const sub = String(parts[1] ?? '').toLowerCase();
+    const denyMode = sub === 'deny' || sub === 'block' || sub === '黑名单' || sub === '挡';
+    const undenyMode = sub === 'undeny' || sub === 'unblock' || sub === '解除';
 
     const persist = () => {
       atomicWriteJson(configFile, file);
       cfg.allow = { ...(cfg.allow ?? {}), groups: file.allow.groups.slice(), private: file.allow.private.slice() };
+      cfg.deny = { ...(cfg.deny ?? {}), groups: file.deny.groups.slice(), private: file.deny.private.slice() };
     };
 
+    const usage = '用法：/allow group 123456 ｜ /allow private 123456 ｜ /allow del group 123456'
+      + ' ｜ /allow deny private 123456（挡住谁、哪个群）｜ /allow undeny private 123456 ｜ /allow list';
+
     if (sub === 'list' || sub === '') {
-      await reply(`白名单：\n群 ${file.allow.groups.join(', ') || '（空）'}\n私聊 ${file.allow.private.join(', ') || '（空）'}\n\n用法：/allow group 123456 ｜ /allow private 123456 ｜ /allow del group 123456`);
+      await reply(`白名单：\n群 ${file.allow.groups.join(', ') || '（空）'}\n私聊 ${file.allow.private.join(', ') || '（空）'}`
+        + `\n\n黑名单（优先于白名单，写进去就进不来）：\n群 ${file.deny.groups.join(', ') || '（空）'}\n私聊 ${file.deny.private.join(', ') || '（空）'}`
+        + `\n\n${usage}`);
       log(`[allow] ${key} 查询白名单`);
       return true;
     }
 
     const removing = sub === 'del' || sub === 'remove';
-    const kindWord = String(parts[removing ? 2 : 1] ?? '').toLowerCase();
-    const numberRaw = String(parts[removing ? 3 : 2] ?? '').trim();
+    const shift = (denyMode || undenyMode || removing) ? 2 : 1;
+    const kindWord = String(parts[shift] ?? '').toLowerCase();
+    const numberRaw = String(parts[shift + 1] ?? '').trim();
     const target = kindWord === 'group' || kindWord === '群' ? 'groups'
       : kindWord === 'private' || kindWord === '私聊' ? 'private'
         : null;
     if (!target || !/^\d{5,12}$/.test(numberRaw)) {
-      await reply('格式不对。用法：/allow group 123456 ｜ /allow private 123456 ｜ /allow del group 123456 ｜ /allow list');
+      await reply(usage);
       return true;
     }
     const num = Number(numberRaw);
+    const label = target === 'groups' ? '群' : '私聊';
+    const convKind = target === 'groups' ? 'group' : 'private';
+    const convK = convKey(convKind, num);
+
+    // 黑名单：allowed() 里 deny 排第一，写进去这个人就彻底进不来（不用管白名单有没有他）
+    if (denyMode || undenyMode) {
+      const denyList = file.deny[target];
+      const existed = denyList.includes(num);
+      if (denyMode && existed) {
+        await reply(`${numberRaw} 已经在${label}黑名单里了。`);
+        return true;
+      }
+      if (undenyMode && !existed) {
+        await reply(`${numberRaw} 本来就不在${label}黑名单里。`);
+        return true;
+      }
+      file.deny[target] = denyMode ? [...denyList, num].sort((a, b) => a - b) : denyList.filter((n) => n !== num);
+      persist();
+      const nowAllowed = modeAllowed(convK, convKind, num, cfg, currentMode);
+      await reply(`${denyMode ? '已挡掉' : '已解除'} ${numberRaw}（${label}）。`
+        + `当前${label}黑名单：${file.deny[target].join(', ') || '（空）'}`
+        + (denyMode ? '\n他现在发什么都进不来了。' : `\n当前是否放行：${nowAllowed ? '是' : '否'}`));
+      log(`[allow] ${key} ${denyMode ? '加入' : '移除'}黑名单 ${target} ${numberRaw}（当前模式放行=${nowAllowed}）`);
+      return true;
+    }
+
     const list = file.allow[target];
     const existed = list.includes(num);
     if (removing) {
       if (!existed) {
-        await reply(`${numberRaw} 本来就不在${target === 'groups' ? '群' : '私聊'}白名单里。`);
+        await reply(`${numberRaw} 本来就不在${label}白名单里。`);
         return true;
       }
       file.allow[target] = list.filter((n) => n !== num);
       persist();
-      const nowAllowed = modeAllowed(convKey(target === 'groups' ? 'group' : 'private', num), target === 'groups' ? 'group' : 'private', num, cfg, currentMode);
-      await reply(`已移除 ${numberRaw}（${target === 'groups' ? '群' : '私聊'}）。当前${target === 'groups' ? '群' : '私聊'}白名单：${file.allow[target].join(', ') || '（空）'}`);
+      const nowAllowed = modeAllowed(convK, convKind, num, cfg, currentMode);
+      await reply(`已移除 ${numberRaw}（${label}）。当前${label}白名单：${file.allow[target].join(', ') || '（空）'}`);
       log(`[allow] ${key} 移除白名单 ${target} ${numberRaw}`);
       return true;
     }
     if (existed) {
-      await reply(`${numberRaw} 已经在${target === 'groups' ? '群' : '私聊'}白名单里了。`);
+      await reply(`${numberRaw} 已经在${label}白名单里了。`);
       return true;
     }
     list.push(num);
     list.sort((a, b) => a - b);
     persist();
-    const nowAllowed = modeAllowed(convKey(target === 'groups' ? 'group' : 'private', num), target === 'groups' ? 'group' : 'private', num, cfg, currentMode);
-    await reply(`已加入 ${numberRaw}（${target === 'groups' ? '群' : '私聊'}）。当前${target === 'groups' ? '群' : '私聊'}白名单：${file.allow[target].join(', ')}${nowAllowed ? '' : '\n⚠️ 但当前模式仍不允许它，可能需要再确认 modeAllowed 的限制'}`);
+    const nowAllowed = modeAllowed(convK, convKind, num, cfg, currentMode);
+    await reply(`已加入 ${numberRaw}（${label}）。当前${label}白名单：${file.allow[target].join(', ')}`
+      + `${nowAllowed ? '' : '\n⚠️ 但当前模式仍不允许它，可能需要再确认 modeAllowed 的限制'}`);
     log(`[allow] ${key} 加入白名单 ${target} ${numberRaw}（当前模式放行=${nowAllowed}）`);
     return true;
   }
