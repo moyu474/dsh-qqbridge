@@ -4542,40 +4542,48 @@ async function main() {
       : mt.includes('webp') ? 'image/webp' : 'image/jpeg';
     if (buf.length <= 900 * 1024 && kind !== 'image/gif') return { buffer: buf, mimeType: kind };
     const ext = kind === 'image/png' ? 'png' : kind === 'image/gif' ? 'gif' : kind === 'image/webp' ? 'webp' : 'jpg';
-    // Decode only the first GIF frame to bound convert output.
-    const input = ext + ':-' + (kind === 'image/gif' ? '[0]' : '');
     const validOutput = (out) => {
       if (!out || !out.length || out.length > 4 * 1024 * 1024 || mimeFromBuffer(out) !== 'image/jpeg') return false;
       const dims = getImageDimensions(out);
       return !!dims && dims.width > 0 && dims.height > 0 && dims.width <= 1568 && dims.height <= 1568;
     };
-    try {
-      const out = execFileSync('convert', [input, '-resize', '1568x1568>', '-quality', '92', 'jpg:-'],
-        { input: buf, maxBuffer: 24 * 1024 * 1024, timeout: 20000, stdio: ['pipe', 'pipe', 'ignore'] });
-      if (validOutput(out)) return { buffer: out, mimeType: 'image/jpeg' };
-    } catch (error) { log('[lite] image compression failed: ' + (error?.message ?? error)); }
-    let dir, fd;
+    // 2026-11-09：**不再从 stdin 喂数据**。GIF 用 `gif:-[0]` 时 convert 读完第一帧就正常退出
+    // （status 0），而 execFileSync 还在往已关闭的管道写剩下几 MB —— 必得 EPIPE。
+    // 实测那张 4.4MB / GIF87a 的图 100% 复现；同样数据走文件路径则一次就成。
+    // 所以先落临时文件，再用文件路径压，两端都不经过管道。
+    let dir;
     try {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qqbridge-vision-'));
-      const file = path.join(dir, 'out.jpg');
-      fd = fs.openSync(file, 'w+', 0o600);
-      execFileSync('convert', [input, '-resize', '1024x1024>', '-quality', '78', 'jpg:-'],
-        { input: buf, timeout: 20000, stdio: ['pipe', fd, 'ignore'] });
-      const stat = fs.fstatSync(fd);
-      if (stat.size > 0 && stat.size <= 4 * 1024 * 1024) {
-        const out = fs.readFileSync(file);
-        if (validOutput(out)) return { buffer: out, mimeType: 'image/jpeg' };
+      const src = path.join(dir, 'in.' + ext);
+      fs.writeFileSync(src, buf, { mode: 0o600 });
+      const input = src + (kind === 'image/gif' ? '[0]' : '');
+      for (const [size, quality] of [['1568x1568>', '92'], ['1024x1024>', '78']]) {
+        const outFile = path.join(dir, 'out-' + quality + '.jpg');
+        try {
+          execFileSync('convert', [input, '-resize', size, '-quality', quality, 'jpg:' + outFile],
+            { maxBuffer: 4 * 1024 * 1024, timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'] });
+          const out = fs.existsSync(outFile) ? fs.readFileSync(outFile) : null;
+          if (validOutput(out)) return { buffer: out, mimeType: 'image/jpeg' };
+          log('[lite] image compression produced invalid output (' + size + ')');
+        } catch (error) {
+          log('[lite] image compression failed (' + size + '): ' + (error?.message ?? error));
+        }
       }
-      log('[lite] image compression retry produced invalid or oversized output');
-    } catch (error) { log('[lite] image compression retry failed: ' + (error?.message ?? error)); }
-    finally {
-      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    } catch (error) {
+      log('[lite] image compression setup failed: ' + (error?.message ?? error));
+    } finally {
       if (dir) {
-        try { fs.unlinkSync(path.join(dir, 'out.jpg')); } catch {}
-        try { fs.rmdirSync(dir); } catch {}
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
       }
     }
-    return kind !== 'image/gif' && buf.length <= 900 * 1024 ? { buffer: buf, mimeType: kind } : null;
+    // 兜底：压不动不等于没图。静态图原样传（≤4MB，仍在 base64 预算内），
+    // GIF 没法原样传（模型端不接受动画），交给调用方按「这轮没图」处理，但日志要说清楚。
+    if (kind !== 'image/gif' && buf.length <= 4 * 1024 * 1024) {
+      log('[lite] image compression unavailable, falling back to original (' + buf.length + ' bytes)');
+      return { buffer: buf, mimeType: kind };
+    }
+    log('[lite] image dropped: gif could not be converted (' + buf.length + ' bytes)');
+    return null;
   }
 
   /** 准备最终发送的图片集合。 */
